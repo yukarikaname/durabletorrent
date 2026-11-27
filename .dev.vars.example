@@ -1,0 +1,3 @@
+# Optional local secret overrides for `cf dev` / `wrangler dev`.
+# Copy to .dev.vars (gitignored) when you want to protect the API locally.
+# API_TOKEN=change-me

@@ -1,0 +1,10 @@
+node_modules/
+.cloudflare/
+.wrangler/
+dist/
+.dev.vars
+.env
+.env.*
+!.env.example
+*.log
+worker-startup.cpuprofile

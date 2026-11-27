@@ -1,0 +1,25 @@
+{
+  "name": "durabletorrent",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Minimal BitTorrent downloader PoC on Cloudflare Workers, Durable Objects (SQLite) and R2.",
+  "engines": {
+    "node": ">=22.23.0"
+  },
+  "scripts": {
+    "dev": "cf dev",
+    "build": "cf build",
+    "deploy": "cf deploy",
+    "types": "cf workers types",
+    "typecheck": "tsc --noEmit",
+    "selftest": "bun run scripts/selftest.ts"
+  },
+  "devDependencies": {
+    "@cloudflare/vite-plugin": "2.0.0-rc.5",
+    "@cloudflare/workers-types": "5.20261127.1",
+    "cf": "1.0.0-rc.6",
+    "typescript": "5.9.3",
+    "vite": "8.4.0"
+  }
+}
