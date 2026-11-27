@@ -372,7 +372,7 @@ export const UI_HTML = String.raw`<!doctype html>
 
   .readout {
     display: grid;
-    grid-template-columns: repeat(3, minmax(0, 1fr));
+    grid-template-columns: repeat(4, minmax(0, 1fr));
     border-top: 1px solid var(--line);
     border-left: 1px solid var(--line);
     margin-top: 14px;
@@ -707,6 +707,9 @@ export const UI_HTML = String.raw`<!doctype html>
     unauthorized: false,
     r2Bytes: 0,
     quota: null,
+    speed: 0,
+    lastSample: null,
+    sampleTask: null,
     pendingSource: null,
     pendingMagnet: null
   };
@@ -736,6 +739,18 @@ export const UI_HTML = String.raw`<!doctype html>
   function date(value) {
     if (!value) return "";
     try { return new Date(value).toLocaleString(); } catch (e) { return String(value); }
+  }
+  function speed(value) {
+    var n = Number(value) || 0;
+    return n > 0 ? bytes(n) + "/s" : "—";
+  }
+  function duration(seconds) {
+    var s = Number(seconds);
+    if (!isFinite(s) || s <= 0) return "—";
+    if (s < 60) return Math.ceil(s) + "s";
+    if (s < 3600) return Math.ceil(s / 60) + " min";
+    if (s < 86400) return Math.floor(s / 3600) + "h " + Math.round((s % 3600) / 60) + "m";
+    return Math.floor(s / 86400) + "d " + Math.round((s % 86400) / 3600) + "h";
   }
   function log(message) {
     var line = "[" + new Date().toLocaleTimeString() + "] " + message + "\n";
@@ -1093,6 +1108,29 @@ export const UI_HTML = String.raw`<!doctype html>
 
   function renderTask(t) {
     state.lastTask = t;
+    var now = Date.now();
+    if (state.sampleTask !== t.id) {
+      state.sampleTask = t.id;
+      state.speed = 0;
+      state.lastSample = { time: now, bytes: Number(t.verifiedBytes) || 0 };
+    } else if (state.lastSample) {
+      var elapsed = (now - state.lastSample.time) / 1000;
+      if (elapsed >= 0.8) {
+        var delta = (Number(t.verifiedBytes) || 0) - state.lastSample.bytes;
+        if (elapsed > 60 || delta < 0) {
+          state.speed = 0;
+        } else if (delta > 0) {
+          var instant = delta / elapsed;
+          state.speed = state.speed > 0 ? state.speed * 0.65 + instant * 0.35 : instant;
+        } else {
+          state.speed = state.speed * 0.8;
+          if (state.speed < 1024) state.speed = 0;
+        }
+        state.lastSample = { time: now, bytes: Number(t.verifiedBytes) || 0 };
+      }
+    }
+    if (t.status !== "downloading" && t.status !== "finalizing") state.speed = 0;
+
     $("taskName").textContent = t.name;
     $("taskSub").textContent = (t.pieceCount || 0) + " pieces of " + bytes(t.pieceLength) +
       ", " + bytes(t.totalLength) + " total. " + countLabel((t.files ? t.files.length : 0), "file", "files") +
@@ -1133,6 +1171,17 @@ export const UI_HTML = String.raw`<!doctype html>
     var values = [
       [percent.toFixed(1) + "%", "verified"],
       [bytes(t.verifiedBytes) + " / " + bytes(t.wantedBytes), "transferred"],
+      [speed(state.speed), "speed"],
+      [
+        t.status === "completed"
+          ? "done"
+          : t.status === "finalizing"
+            ? "finalizing"
+            : state.speed > 0 && t.leftBytes > 0
+              ? duration(t.leftBytes / state.speed)
+              : "—",
+        "time left",
+      ],
       [bytes(t.leftBytes), "left"],
       [String(t.peerCount || 0), "peers"],
       [String((t.trackers || []).length), "trackers"],
@@ -1327,6 +1376,9 @@ export const UI_HTML = String.raw`<!doctype html>
     stopPolling();
     state.id = null;
     state.lastTask = null;
+    state.speed = 0;
+    state.lastSample = null;
+    state.sampleTask = null;
     $("taskName").textContent = "No transfer yet";
     $("taskSub").textContent = "Drop a torrent or resolve a magnet to begin.";
     $("taskStatus").className = "status idle";

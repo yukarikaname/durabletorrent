@@ -2,7 +2,7 @@
 
 A minimal, outbound-only BitTorrent downloader that runs on **Cloudflare Workers + Durable Objects (SQLite) + R2**.
 
-**Live PoC:** https://durabletorrent.aliciaworks.workers.dev — public read-only; changes require the admin token.
+**Live demo:** https://durabletorrent.aliciaworks.workers.dev — public read-only; changes require the admin token.
 
 It is a proof of concept, not a production client. It downloads a selected subset of a torrent, verifies pieces with SHA-1, stages verified pieces in R2, and assembles the final object with R2 multipart upload. It **never accepts inbound connections and never unchokes a peer**, so it cannot seed.
 
@@ -227,7 +227,7 @@ Workers limits each invocation to **6 simultaneous outbound connection attempts*
 - Drag a `.torrent` file or a magnet link onto the drop zone.
 - Inspect a `.torrent` or resolve a magnet's metadata first, then choose exactly which files to download.
 - Paste a magnet link; extra trackers can be supplied if the magnet has none.
-- Watch verified pieces fill the map in amber, along with peers, trackers, bytes and storage.
+- Watch verified pieces fill the map in amber, along with peers, speed, time left, trackers, bytes and storage.
 - Use the **Free-only safeguards** toggle (on by default) to keep one task and the R2 bucket inside conservative free-tier caps.
 - The main panel estimates how large a file can be for a given keep time; at download time a notice shows the latest free-tier pickup date and files are deleted automatically then.
 - Add HTTP(S) trackers to a running task.
