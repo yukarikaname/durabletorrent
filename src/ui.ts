@@ -590,6 +590,7 @@ export const UI_HTML = String.raw`<!doctype html>
               <option value="staging/">staging/</option>
             </select>
             <button id="refreshFiles" class="button">Refresh</button>
+            <button class="button small danger" onclick="app.deleteAll()">Delete all</button>
           </div>
         </div>
         <p id="storageSummary" class="note"></p>
@@ -939,6 +940,9 @@ export const UI_HTML = String.raw`<!doctype html>
     if (t.status === "completed") {
       actions.push('<button class="button primary" onclick="app.download()">Download file</button>');
       actions.push('<button class="button" onclick="app.manifest()">Open manifest</button>');
+      if (t.usage && t.usage.stagingBytes > 0) {
+        actions.push('<button class="button" onclick="app.cleanup()">Clean staging</button>');
+      }
     }
     actions.push('<button class="button quiet" onclick="app.refresh()">Refresh</button>');
     actions.push('<button class="button danger" onclick="app.remove()">Delete transfer</button>');
@@ -1039,6 +1043,26 @@ export const UI_HTML = String.raw`<!doctype html>
     $("storageSummary").textContent = summary + ".";
   }
 
+  function resetTaskView() {
+    stopPolling();
+    state.id = null;
+    state.lastTask = null;
+    $("taskName").textContent = "No transfer yet";
+    $("taskSub").textContent = "Drop a torrent or resolve a magnet to begin.";
+    $("taskStatus").className = "status idle";
+    $("statusText").textContent = "idle";
+    $("stats").innerHTML = "";
+    $("actions").innerHTML = "";
+    $("files").innerHTML = "";
+    $("trackersList").innerHTML = "";
+    $("cost").innerHTML = "";
+    $("error").classList.add("hidden");
+    $("mapEmpty").classList.remove("hidden");
+    drawMap(0, "", false);
+    step("stepAdd");
+    try { history.replaceState(null, "", location.pathname); } catch (e) {}
+  }
+
   window.app = {
     pause: async function () {
       try { await api("/api/torrents/" + state.id + "/pause", { method: "POST" }); } catch (e) { setError(e.message); }
@@ -1057,23 +1081,30 @@ export const UI_HTML = String.raw`<!doctype html>
         if (result.cleanupErrors && result.cleanupErrors.length) {
           log("cleanup warnings: " + result.cleanupErrors.join("; "));
         }
-        stopPolling(); state.id = null; state.lastTask = null;
-        $("taskName").textContent = "No transfer yet";
-        $("taskSub").textContent = "Drop a torrent or resolve a magnet to begin.";
-        $("taskStatus").className = "status idle";
-        $("statusText").textContent = "idle";
-        $("stats").innerHTML = "";
-        $("actions").innerHTML = "";
-        $("files").innerHTML = "";
-        $("trackersList").innerHTML = "";
-        $("cost").innerHTML = "";
-        $("error").classList.add("hidden");
-        $("mapEmpty").classList.remove("hidden");
-        drawMap(0, "", false);
-        step("stepAdd");
-        try { history.replaceState(null, "", location.pathname); } catch (e) {}
+        resetTaskView();
         await refreshFiles();
         log("transfer deleted");
+      } catch (e) { setError(e.message); }
+    },
+    cleanup: async function () {
+      if (!state.id) return;
+      try {
+        renderTask(await api("/api/torrents/" + state.id + "/cleanup", { method: "POST" }));
+        await refreshFiles();
+        log("staging cleaned");
+      } catch (e) { setError(e.message); }
+    },
+    deleteAll: async function () {
+      var phrase = prompt("This deletes every task and every R2 object. Type DELETE to continue.");
+      if (phrase !== "DELETE") return;
+      try {
+        var result = await api("/api/all", { method: "DELETE" });
+        resetTaskView();
+        await refreshFiles();
+        log("deleted " + result.tasksDeleted + " tasks and " + result.objectsDeleted + " R2 objects");
+        if (result.errors && result.errors.length) {
+          log("delete all warnings: " + result.errors.join("; "));
+        }
       } catch (e) { setError(e.message); }
     },
     download: function () {

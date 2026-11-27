@@ -191,6 +191,7 @@ A torrent piece is usually much smaller than 5 MiB (and may be 16 KiB), so the P
 3. Every full 8 MiB buffer is uploaded as a multipart part; the last part may be smaller.
 4. `finalize_cursor` is the output offset of the next part; `multipart_parts_json` stores uploaded `{partNumber, etag}` values. After a crash, the DO calls `resumeMultipartUpload()` and continues.
 5. On completion, a `manifest.json` is written and the task becomes `completed`.
+6. A follow-up alarm deletes the staging prefix. The output, manifest and source torrent remain; the cleanup is resumable and can also be triggered with `POST /api/torrents/:infoHash/cleanup`.
 
 If a staged piece is missing or truncated during finalization, the multipart upload is aborted, the piece is marked missing, and the task returns to `downloading`.
 
@@ -229,7 +230,8 @@ Workers limits each invocation to **6 simultaneous outbound connection attempts*
 - Watch verified pieces fill the map in amber, along with peers, trackers, bytes and storage.
 - Add HTTP(S) trackers to a running task.
 - Download the completed output or its manifest.
-- Browse/delete R2 objects under `downloads/`, `staging/`, `torrents/`.
+- Staging is merged into the output and deleted automatically; a manual "Clean staging" action is available for older tasks.
+- Browse/delete individual R2 objects, or use "Delete all" to remove every task and object.
 - See a rough cost estimate for the task and for R2 storage.
 - Optional API token stored in `localStorage`.
 - Open `/?task=<infoHash>` to return to a transfer by its info hash.
@@ -271,9 +273,11 @@ POST   /api/torrents/:infoHash/start
 POST   /api/torrents/:infoHash/pause
 POST   /api/torrents/:infoHash/tick   run one scheduler cycle (debug)
 POST   /api/torrents/:infoHash/trackers  { "urls": ["https://..."] }
+POST   /api/torrents/:infoHash/cleanup   delete staging for a completed transfer
 GET    /api/torrents/:infoHash/download
 GET    /api/torrents/:infoHash/manifest
 DELETE /api/torrents/:infoHash        delete the session and its R2 objects
+DELETE /api/all                       delete every task and every R2 object
 GET    /api/files?all=1&prefix=       list R2 objects (max 10,000 per call)
 GET    /api/files/object?key=...      stream one R2 object
 DELETE /api/files/object?key=...      delete one R2 object
@@ -376,10 +380,11 @@ Current result: **95 assertions passed**.
 The deployed instance downloaded the first **8,388,607 bytes** of the official
 Debian 13.8.0 amd64 netinst ISO via its torrent (32 of 3,032 pieces, 8 MiB
 selection). The SHA-256 of the R2 output matched the same range fetched from
-`cdimage.debian.org`. It completed in three scheduler waves, used about
-16.1 MiB of R2 storage, and the cost estimate was roughly **$0.00065** at list
-prices. The test task is visible at `/?task=e75a1a6b922815d64cfa9b8904208d3a85143495`
-while it remains in the bucket.
+`cdimage.debian.org`. It completed in three scheduler waves. Staging was then
+deleted automatically, leaving the torrent, 8 MiB output and manifest:
+about **8.06 MiB** of R2 storage and a list-price estimate of roughly
+**$0.00054**. The specific test task was later removed by the `DELETE /api/all`
+check; the measurements above are from that run.
 
 No copyrighted content was downloaded for testing; the Debian ISO is a
 freely redistributable image.
@@ -390,7 +395,7 @@ freely redistributable image.
 
 The status endpoint returns `usage` and `estimatedCost`. The UI renders it. The model is deliberately rough:
 
-- **R2 storage:** `$0.015 / GB-month`, 10 GB free. Per task: torrent + staging pieces + output + manifest, priced as if retained for one month.
+- **R2 storage:** `$0.015 / GB-month`, 10 GB free. Per task: the source torrent, staging while downloading, the output and manifest, priced as if retained for one month. Staging is removed after completion.
 - **R2 Class A:** `$4.50 / million` (PUT, multipart create/upload/complete); 1 M free.
 - **R2 Class B:** `$0.36 / million` (GET); 10 M free.
 - **Durable Objects:** `$0.15 / million` requests (1 M free); `$12.50 / million GB-s` duration (400 k GB-s free), billed at 128 MB; SQLite rows read `$0.001 / million` (25 B free) and written `$1.00 / million` (50 M free).
@@ -421,10 +426,11 @@ Counters are best-effort: DO requests and alarm wall time are exact; R2 PUT/GET 
 
 - **R2 part alignment:** one piece is not one part. The 5 MiB minimum and uniform-part rule are handled by staging + 8 MiB finalization parts.
 - **R2 parts are capped at 10,000.** Output is rejected at init if it exceeds `10,000 × R2_PART_SIZE` (≈80 GiB at 8 MiB).
-- **Staging objects are retained after completion.** Deleting the task removes them; otherwise they keep costing storage. There is no automatic GC.
+- **Staging is deleted automatically after completion.** The completed task keeps the output, manifest and source torrent; staging cleanup is a separate resumable alarm. If cleanup fails, it retries, and `POST /api/torrents/:infoHash/cleanup` is available manually.
 - **One R2 PUT per verified piece.** Torrents with 16–256 KiB pieces create many Class A operations. This is simple and resumable, but not the cheapest design for very large torrents.
 - **Staging read amplification:** finalization reads overlapping pieces through R2 range GETs; a piece may be read more than once if selected ranges are fragmented.
 - **Large task deletion** can take many R2 list/delete calls (1000 keys per call) and may exceed a request's practical time.
+- **Delete all** discovers task IDs from R2 keys (`torrents/`, `downloads/`, `staging/`). A task whose torrent object was manually deleted and that has no remaining R2 keys cannot be discovered without a global task index.
 - **DO SQLite init is O(wanted pieces).** 50,000 piece rows is the PoC cap and can take noticeable CPU.
 - **Free plan CPU is 10 ms.** Use Workers Paid for real torrent parsing and SHA-1 verification; the deployed config does not request a custom CPU limit because the Free plan rejects it.
 - **Alarm wall clock is 15 minutes.** Waves are capped at 8 minutes and finalization at 6 minutes.

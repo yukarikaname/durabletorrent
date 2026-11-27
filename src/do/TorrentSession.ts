@@ -130,6 +130,8 @@ export class TorrentSession extends DurableObject<Env> {
           return await this.handleTick();
         case "POST /trackers":
           return await this.handleTrackers(request);
+        case "POST /cleanup":
+          return await this.handleCleanup();
         case "DELETE /":
           return await this.handleDelete();
         default:
@@ -154,7 +156,12 @@ export class TorrentSession extends DurableObject<Env> {
     try {
       const task = getTask(this.sql);
       if (!task) return;
-      if (task.status === "paused" || task.status === "completed" || task.status === "failed") return;
+      if (task.status === "completed") {
+        ran = true;
+        if (task.staging_cleaned === 0) await this.cleanupStaging(task);
+        return;
+      }
+      if (task.status === "paused" || task.status === "failed") return;
       if (task.status === "queued") return;
       ran = true;
       if (task.status === "finalizing") await this.runFinalize(task);
@@ -231,8 +238,8 @@ export class TorrentSession extends DurableObject<Env> {
           announcements, wave_count, consecutive_failures, last_error,
           created_at, updated_at, started_at, completed_at,
           torrent_bytes, do_requests, alarm_count, wave_duration_ms,
-          r2_put_ops, r2_get_ops, tracker_requests, peer_connections
-        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+          r2_put_ops, r2_get_ops, tracker_requests, peer_connections, staging_cleaned
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
         id,
         exactArrayBuffer(meta.infoHash),
         meta.name,
@@ -275,6 +282,7 @@ export class TorrentSession extends DurableObject<Env> {
         0,
         0,
         0,
+        0,
       );
 
       this.insertPieces(meta, resolved.wantedPieces);
@@ -291,6 +299,15 @@ export class TorrentSession extends DurableObject<Env> {
   private handleStatus(url: URL): Response {
     const task = getTask(this.sql);
     if (!task) return json({ error: "torrent session not found" }, 404);
+    if (task.status === "completed" && task.staging_cleaned === 0) {
+      // Old tasks may still have staging objects. Opening the task schedules a
+      // one-shot cleanup, the same path new completions use. Do not reset an
+      // alarm that is already pending.
+      void this.ctx.storage
+        .getAlarm()
+        .then((alarm) => (alarm === null ? this.schedule(Date.now() + 100) : undefined))
+        .catch(() => undefined);
+    }
     return json(this.statusJson(task, url.searchParams.get("bits") === "1"));
   }
 
@@ -341,6 +358,17 @@ export class TorrentSession extends DurableObject<Env> {
     }
 
     if (task.status === "downloading") await this.schedule(Date.now() + 100);
+    return json(this.statusJson(getTask(this.sql)!));
+  }
+
+  private async handleCleanup(): Promise<Response> {
+    const task = getTask(this.sql);
+    if (!task) return json({ error: "torrent session not found" }, 404);
+    if (task.status !== "completed") {
+      return json({ error: "only a completed transfer can clean staging" }, 409);
+    }
+
+    if (task.staging_cleaned === 0) await this.cleanupStaging(task);
     return json(this.statusJson(getTask(this.sql)!));
   }
 
@@ -1154,6 +1182,15 @@ export class TorrentSession extends DurableObject<Env> {
     } while (cursor);
   }
 
+  private async cleanupStaging(task: TaskRow): Promise<void> {
+    await this.deletePrefix(stagingPrefix(task.id));
+    this.sql.exec(
+      "UPDATE task SET staging_cleaned=1, updated_at=? WHERE id=?",
+      Date.now(),
+      task.id,
+    );
+  }
+
   // ---------------------------------------------------------------------------
   // Scheduling
   // ---------------------------------------------------------------------------
@@ -1164,11 +1201,23 @@ export class TorrentSession extends DurableObject<Env> {
 
   private async ensureAlarm(): Promise<void> {
     const task = getTask(this.sql);
+    if (!task) {
+      await this.ctx.storage.deleteAlarm();
+      return;
+    }
+
+    if (task.status === "completed") {
+      if (task.staging_cleaned === 0) {
+        await this.schedule(Date.now() + 5 * 60_000);
+      } else {
+        await this.ctx.storage.deleteAlarm();
+      }
+      return;
+    }
+
     if (
-      !task ||
       task.status === "queued" ||
       task.status === "paused" ||
-      task.status === "completed" ||
       task.status === "failed"
     ) {
       await this.ctx.storage.deleteAlarm();
@@ -1227,7 +1276,7 @@ export class TorrentSession extends DurableObject<Env> {
 
     const usage = {
       torrentBytes: task.torrent_bytes,
-      stagingBytes: task.verified_bytes,
+      stagingBytes: task.staging_cleaned ? 0 : task.verified_bytes,
       outputBytes: outputStoredBytes,
       doRequests: task.do_requests,
       alarmCount: task.alarm_count,
@@ -1275,7 +1324,7 @@ export class TorrentSession extends DurableObject<Env> {
       selection,
       usage: {
         ...usage,
-        storedBytes: task.torrent_bytes + task.verified_bytes + outputStoredBytes + manifestBytes,
+        storedBytes: task.torrent_bytes + usage.stagingBytes + outputStoredBytes + manifestBytes,
       },
       estimatedCost,
       pricingAsOf: estimatedCost.pricingAsOf,

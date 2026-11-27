@@ -60,6 +60,7 @@ export interface TaskRow extends Record<string, SqlRowValue> {
   r2_get_ops: number;
   tracker_requests: number;
   peer_connections: number;
+  staging_cleaned: number;
   created_at: number;
   updated_at: number;
   started_at: number | null;
@@ -139,6 +140,7 @@ export function ensureSchema(sql: SqlStorage): void {
       r2_get_ops INTEGER NOT NULL DEFAULT 0,
       tracker_requests INTEGER NOT NULL DEFAULT 0,
       peer_connections INTEGER NOT NULL DEFAULT 0,
+      staging_cleaned INTEGER NOT NULL DEFAULT 0,
       created_at INTEGER NOT NULL,
       updated_at INTEGER NOT NULL,
       started_at INTEGER,
@@ -201,6 +203,7 @@ export function ensureSchema(sql: SqlStorage): void {
     r2_get_ops: "INTEGER NOT NULL DEFAULT 0",
     tracker_requests: "INTEGER NOT NULL DEFAULT 0",
     peer_connections: "INTEGER NOT NULL DEFAULT 0",
+    staging_cleaned: "INTEGER NOT NULL DEFAULT 0",
   };
   for (const [column, definition] of Object.entries(additions)) {
     if (!existing.has(column)) {

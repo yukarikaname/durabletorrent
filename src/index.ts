@@ -113,6 +113,10 @@ export default {
         return await r2Cost(env);
       }
 
+      if (request.method === "DELETE" && url.pathname === "/api/all") {
+        return await deleteAll(env);
+      }
+
       const route = parseTorrentRoute(url.pathname);
       if (!route) return json({ error: "not found" }, 404);
 
@@ -151,6 +155,10 @@ export default {
           headers: { "content-type": "application/json" },
           body,
         });
+      }
+
+      if (request.method === "POST" && route.action === "cleanup") {
+        return await stub.fetch("https://do.internal/cleanup", { method: "POST" });
       }
 
       if (request.method === "DELETE" && !route.action) {
@@ -384,6 +392,62 @@ async function r2Cost(env: Env): Promise<Response> {
   });
 }
 
+/**
+ * Destructive maintenance endpoint: remove every DurableTorrent task and every
+ * R2 object under the three known prefixes.
+ *
+ * Task IDs are discovered from the union of torrent/download/staging keys, so
+ * objects left behind by a failed task are removed too. A task whose torrent
+ * object was manually deleted cannot be discovered without a global index.
+ */
+async function deleteAll(env: Env): Promise<Response> {
+  const prefixes = ["torrents/", "downloads/", "staging/"] as const;
+  const keys: string[] = [];
+  const ids = new Set<string>();
+
+  for (const prefix of prefixes) {
+    let cursor: string | undefined;
+    do {
+      const listed = await env.BLOBS.list({ prefix, cursor, limit: 1000 });
+      for (const object of listed.objects) {
+        keys.push(object.key);
+        const match = /^(?:torrents|downloads|staging)\/([0-9a-f]{40})(?:\/|\.torrent$)/.exec(
+          object.key,
+        );
+        if (match) ids.add(match[1]);
+      }
+      cursor = listed.truncated ? listed.cursor : undefined;
+    } while (cursor);
+  }
+
+  const errors: string[] = [];
+  let tasksDeleted = 0;
+  for (const id of ids) {
+    try {
+      await env.TORRENT_SESSION.getByName(id).fetch("https://do.internal/", { method: "DELETE" });
+      tasksDeleted++;
+    } catch (error) {
+      errors.push(`${id}: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+
+  for (let offset = 0; offset < keys.length; offset += 1000) {
+    try {
+      await env.BLOBS.delete(keys.slice(offset, offset + 1000));
+    } catch (error) {
+      errors.push(`R2 delete: ${error instanceof Error ? error.message : String(error)}`);
+      break;
+    }
+  }
+
+  return json({
+    deleted: true,
+    tasksDeleted,
+    objectsDeleted: keys.length,
+    errors: errors.slice(0, 20),
+  });
+}
+
 async function collectObjects(
   env: Env,
   prefix: string,
@@ -478,7 +542,7 @@ function parseTorrentRoute(
 ):
   | {
       id: string;
-      action: "start" | "pause" | "tick" | "download" | "manifest" | "trackers" | null;
+      action: "start" | "pause" | "tick" | "download" | "manifest" | "trackers" | "cleanup" | null;
     }
   | null {
   const parts = pathname.split("/").filter(Boolean);
@@ -489,13 +553,21 @@ function parseTorrentRoute(
   const action = parts.length === 4 ? parts[3] : null;
   if (
     action &&
-    !["start", "pause", "tick", "download", "manifest", "trackers"].includes(action)
+    !["start", "pause", "tick", "download", "manifest", "trackers", "cleanup"].includes(action)
   ) {
     return null;
   }
   return {
     id,
-    action: action as "start" | "pause" | "tick" | "download" | "manifest" | "trackers" | null,
+    action: action as
+      | "start"
+      | "pause"
+      | "tick"
+      | "download"
+      | "manifest"
+      | "trackers"
+      | "cleanup"
+      | null,
   };
 }
 
@@ -546,9 +618,11 @@ function apiDescription(): Record<string, unknown> {
       "POST /api/torrents/:infoHash/pause": "pause scheduling",
       "POST /api/torrents/:infoHash/tick": "run one scheduler cycle immediately (debug)",
       "POST /api/torrents/:infoHash/trackers": "JSON body { urls: [...] } — add HTTP(S) trackers",
+      "POST /api/torrents/:infoHash/cleanup": "delete staging objects for a completed transfer",
       "GET /api/torrents/:infoHash/download": "stream the completed R2 object",
       "GET /api/torrents/:infoHash/manifest": "download the JSON manifest",
       "DELETE /api/torrents/:infoHash": "delete the session and its R2 objects",
+      "DELETE /api/all": "delete every task and every R2 object (destructive)",
       "GET /api/files?prefix=&cursor=&limit=&all=1": "list R2 objects",
       "GET /api/files/object?key=": "stream one R2 object",
       "DELETE /api/files/object?key=": "delete one R2 object",
