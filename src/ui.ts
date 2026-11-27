@@ -834,6 +834,7 @@ export const UI_HTML = String.raw`<!doctype html>
       for (var candidate = 1; candidate <= count; candidate++) {
         var candidateRows = Math.ceil(count / candidate);
         var score = Math.abs(candidate / candidateRows - target) + Math.abs(candidate * candidateRows - count) * 0.001;
+        if (count % candidate === 0) score -= 0.6;
         if (score < bestScore) { bestScore = score; cols = candidate; }
       }
     } else {
@@ -850,36 +851,54 @@ export const UI_HTML = String.raw`<!doctype html>
 
     ctx.strokeStyle = "rgba(228, 233, 228, .075)";
     ctx.lineWidth = 1;
-    for (var c = 0; c <= cols; c++) {
-      var x = Math.round(ox + c * cell) + .5;
-      ctx.beginPath(); ctx.moveTo(x, oy); ctx.lineTo(x, oy + gridH); ctx.stroke();
-    }
-    for (var r = 0; r <= rows; r++) {
-      var y = Math.round(oy + r * cell) + .5;
-      ctx.beginPath(); ctx.moveTo(ox, y); ctx.lineTo(ox + gridW, y); ctx.stroke();
-    }
 
-    if (!hasTask || count <= 240) {
-      ctx.fillStyle = "#17363b";
+    if (count <= 240) {
       for (var i = 0; i < count; i++) {
         var cx = i % cols;
         var cy = Math.floor(i / cols);
-        ctx.fillRect(ox + cx * cell + gap, oy + cy * cell + gap, Math.max(1, cell - gap * 2), Math.max(1, cell - gap * 2));
+        var x0 = ox + cx * cell + gap;
+        var y0 = oy + cy * cell + gap;
+        var size = Math.max(1, cell - gap * 2);
+        var verified = hasTask && bitAt(hex, indices[i]);
+        ctx.fillStyle = verified ? "#dfa33a" : "#17363b";
+        ctx.fillRect(x0, y0, size, size);
+        ctx.strokeStyle = "rgba(228, 233, 228, .13)";
+        ctx.strokeRect(Math.round(x0) + .5, Math.round(y0) + .5, Math.max(1, size - 1), Math.max(1, size - 1));
+      }
+    } else {
+      for (var c = 0; c <= cols; c++) {
+        var x = Math.round(ox + c * cell) + .5;
+        ctx.beginPath(); ctx.moveTo(x, oy); ctx.lineTo(x, oy + gridH); ctx.stroke();
+      }
+      for (var r = 0; r <= rows; r++) {
+        var y = Math.round(oy + r * cell) + .5;
+        ctx.beginPath(); ctx.moveTo(ox, y); ctx.lineTo(ox + gridW, y); ctx.stroke();
+      }
+
+      if (!hasTask) {
+        ctx.fillStyle = "#17363b";
+        for (var m = 0; m < count; m++) {
+          var mx = m % cols;
+          var my = Math.floor(m / cols);
+          ctx.fillRect(ox + mx * cell + gap, oy + my * cell + gap, Math.max(1, cell - gap * 2), Math.max(1, cell - gap * 2));
+        }
+      }
+
+      if (hasTask) {
+        ctx.fillStyle = "#dfa33a";
+        for (var p = 0; p < count; p++) {
+          if (!bitAt(hex, indices[p])) continue;
+          var px = p % cols;
+          var py = Math.floor(p / cols);
+          ctx.fillRect(ox + px * cell + gap, oy + py * cell + gap, Math.max(1, cell - gap * 2), Math.max(1, cell - gap * 2));
+        }
       }
     }
 
-    if (hasTask) {
-      ctx.fillStyle = "#dfa33a";
-      for (var p = 0; p < count; p++) {
-        if (!bitAt(hex, indices[p])) continue;
-        var px = p % cols;
-        var py = Math.floor(p / cols);
-        ctx.fillRect(ox + px * cell + gap, oy + py * cell + gap, Math.max(1, cell - gap * 2), Math.max(1, cell - gap * 2));
-      }
+    if (count <= 240 || !hasTask || count % cols === 0) {
+      ctx.strokeStyle = "rgba(228, 233, 228, .22)";
+      ctx.strokeRect(Math.round(ox) + .5, Math.round(oy) + .5, Math.round(gridW), Math.round(gridH));
     }
-
-    ctx.strokeStyle = "rgba(228, 233, 228, .22)";
-    ctx.strokeRect(Math.round(ox) + .5, Math.round(oy) + .5, Math.round(gridW), Math.round(gridH));
     $("mapWrap").classList.toggle("is-running", Boolean(running));
   }
 
