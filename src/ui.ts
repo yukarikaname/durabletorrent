@@ -545,7 +545,7 @@ export const UI_HTML = String.raw`<!doctype html>
         </div>
 
         <div class="map-wrap" id="mapWrap">
-          <canvas id="pieceMap" role="img" aria-label="Verified piece map"></canvas>
+          <canvas id="pieceMap" role="img" aria-label="Piece map for the selected pieces"></canvas>
           <div class="map-empty" id="mapEmpty">The piece map fills as blocks verify.</div>
           <div class="map-scan" aria-hidden="true"></div>
           <div class="map-legend" aria-hidden="true">
@@ -791,7 +791,7 @@ export const UI_HTML = String.raw`<!doctype html>
     return (byte & (0x80 >> (index & 7))) !== 0;
   }
 
-  function drawMap(pieceCount, hex, running) {
+  function drawMap(pieceCount, hex, running, selection, pieceLength) {
     var canvas = $("pieceMap");
     var rect = canvas.getBoundingClientRect();
     var dpr = window.devicePixelRatio || 1;
@@ -806,8 +806,26 @@ export const UI_HTML = String.raw`<!doctype html>
     ctx.fillStyle = "#0b2024";
     ctx.fillRect(0, 0, width, height);
 
-    var hasTask = Number(pieceCount) > 0;
-    var count = hasTask ? Number(pieceCount) : 384;
+    var total = Number(pieceCount) || 0;
+    var indices = [];
+    if (total > 0) {
+      if (selection && selection.ranges && selection.ranges.length && pieceLength > 0) {
+        var seen = Object.create(null);
+        selection.ranges.forEach(function (range) {
+          var first = Math.max(0, Math.floor(range.start / pieceLength));
+          var last = Math.min(total - 1, Math.floor((range.start + range.length - 1) / pieceLength));
+          for (var p = first; p <= last; p++) {
+            if (!seen[p]) { seen[p] = 1; indices.push(p); }
+          }
+        });
+      }
+      if (indices.length === 0) {
+        for (var all = 0; all < total; all++) indices.push(all);
+      }
+    }
+
+    var hasTask = indices.length > 0;
+    var count = hasTask ? indices.length : 384;
     var cols;
     if (count <= 240) {
       var target = width / height;
@@ -853,7 +871,7 @@ export const UI_HTML = String.raw`<!doctype html>
     if (hasTask) {
       ctx.fillStyle = "#dfa33a";
       for (var p = 0; p < count; p++) {
-        if (!bitAt(hex, p)) continue;
+        if (!bitAt(hex, indices[p])) continue;
         var px = p % cols;
         var py = Math.floor(p / cols);
         ctx.fillRect(ox + px * cell + gap, oy + py * cell + gap, Math.max(1, cell - gap * 2), Math.max(1, cell - gap * 2));
@@ -876,7 +894,7 @@ export const UI_HTML = String.raw`<!doctype html>
     $("statusText").textContent = t.status;
 
     var percent = Math.max(0, Math.min(100, (Number(t.progress) || 0) * 100));
-    drawMap(t.pieceCount, t.verifiedBitmap, t.status === "downloading" || t.status === "finalizing");
+    drawMap(t.pieceCount, t.verifiedBitmap, t.status === "downloading" || t.status === "finalizing", t.selection, t.pieceLength);
     $("mapEmpty").classList.toggle("hidden", Boolean(t.pieceCount));
 
     var values = [
@@ -1119,7 +1137,8 @@ export const UI_HTML = String.raw`<!doctype html>
       resizeTimer = setTimeout(function () {
         if (state.lastTask) {
           drawMap(state.lastTask.pieceCount, state.lastTask.verifiedBitmap,
-            state.lastTask.status === "downloading" || state.lastTask.status === "finalizing");
+            state.lastTask.status === "downloading" || state.lastTask.status === "finalizing",
+            state.lastTask.selection, state.lastTask.pieceLength);
         }
       }, 120);
     });
