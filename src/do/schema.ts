@@ -27,6 +27,8 @@ export interface TaskRow extends Record<string, SqlRowValue> {
   name: string;
   status: TaskStatus;
   free_only: number;
+  retain_hours: number;
+  expires_at: number | null;
   torrent_key: string;
   output_key: string | null;
   manifest_key: string | null;
@@ -108,6 +110,8 @@ export function ensureSchema(sql: SqlStorage): void {
       name TEXT NOT NULL,
       status TEXT NOT NULL,
       free_only INTEGER NOT NULL DEFAULT 1,
+      retain_hours INTEGER NOT NULL DEFAULT 720,
+      expires_at INTEGER,
       torrent_key TEXT NOT NULL,
       output_key TEXT,
       manifest_key TEXT,
@@ -198,6 +202,8 @@ export function ensureSchema(sql: SqlStorage): void {
   );
   const additions: Record<string, string> = {
     free_only: "INTEGER NOT NULL DEFAULT 1",
+    retain_hours: "INTEGER NOT NULL DEFAULT 720",
+    expires_at: "INTEGER",
     torrent_bytes: "INTEGER NOT NULL DEFAULT 0",
     do_requests: "INTEGER NOT NULL DEFAULT 0",
     alarm_count: "INTEGER NOT NULL DEFAULT 0",

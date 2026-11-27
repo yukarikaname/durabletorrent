@@ -229,11 +229,12 @@ Workers limits each invocation to **6 simultaneous outbound connection attempts*
 - Paste a magnet link; extra trackers can be supplied if the magnet has none.
 - Watch verified pieces fill the map in amber, along with peers, trackers, bytes and storage.
 - Use the **Free-only safeguards** toggle (on by default) to keep one task and the R2 bucket inside conservative free-tier caps.
+- The main panel estimates how large a file can be for a given keep time; at download time a notice shows the latest free-tier pickup date and files are deleted automatically then.
 - Add HTTP(S) trackers to a running task.
 - Download the completed output or its manifest.
 - Staging is merged into the output and deleted automatically; a manual "Clean staging" action is available for older tasks.
 - Browse/delete individual R2 objects, or use "Delete all" to remove every task and object.
-- In free mode, see a storage quota bar and how many days the current data fits in the R2 free allowance; otherwise see a rough cost estimate.
+- In free mode, see a GB-month quota bar, the latest pickup time, and an estimate of how much another file could be downloaded for a chosen keep time; otherwise see a rough cost estimate.
 - Optional admin token stored in `localStorage`; readers can browse without it.
 - Open `/?task=<infoHash>` to return to a transfer by its info hash.
 
@@ -276,6 +277,7 @@ POST   /api/torrents/:infoHash/pause
 POST   /api/torrents/:infoHash/tick   run one scheduler cycle (debug)
 POST   /api/torrents/:infoHash/trackers  { "urls": ["https://..."] }
 POST   /api/torrents/:infoHash/cleanup   delete staging for a completed transfer
+POST   /api/torrents/:infoHash/expire    delete the output and manifest now
 GET    /api/torrents/:infoHash/download
 GET    /api/torrents/:infoHash/manifest
 DELETE /api/torrents/:infoHash        delete the session and its R2 objects
@@ -326,25 +328,61 @@ when the flag is absent. It applies conservative caps:
 | Peers per wave | 4 |
 | Verified bytes per wave | 4 MiB |
 | R2 bucket usage before a new task | 9 GiB safety budget |
+| Automatic retention | 1–720 hours, default 720; free allowance caps it |
 
-Before creating a task, the Durable Object sums R2 objects and rejects the
-selection if `current usage + staging + output + manifest` would exceed the
-9 GiB safety budget. Staging is counted as roughly one extra copy of the output,
-because it coexists with the final object until cleanup. The UI shows a quota bar instead of the itemised cost table:
+**R2 is billed in GB-month, not by instantaneous GB or by the hour.** Cloudflare
+calculates a GB-month from the average of the **daily peak** storage over the
+billing period. This PoC therefore uses a conservative daily-peak estimate:
 
-- storage used against the 9 GiB safety budget;
-- room for another download after staging is cleaned up (staging temporarily
-  needs about a second copy of the output);
-- how many days the current bucket size lasts under the **10 GB-month** R2
-  free allowance (`10 / used GB × 30 days`);
-- the 10 GB-month free allowance itself.
+```text
+gbMonth for one object = sizeGB × billableDays / 30
+billableDays = max(1, ceil(ageHours / 24))
+```
+
+Any part of a day counts as a full day. A 200 GB object kept for one hour is
+therefore estimated at `200 × 1 / 30 = 6.67 GB-month`, not `200 / 720`. It leaves
+about 3.33 GB-month of the 10 GB-month free allowance; keeping it a second day
+would exceed the free allowance.
+
+Retention is automatic. The UI shows a quota notice when a transfer is created:
+
+> Free tier: take the file before **date**. It will be deleted automatically at
+> that time.
+
+For a queued/downloading task it shows an estimate based on the selected output
+size and current bucket usage. The Durable Object computes the exact deadline
+when finalization completes:
+
+- `freeTotalDays = 1 + floor(remainingGbMonth × 30 / outputGB)`
+- `expires_at = completion + min(720h, freeTotalDays × 24h)`
+
+The main panel also has a **R2 free allowance estimate** calculator: enter a
+file size in GB and a keep time in days; it shows the GB-month used, the maximum
+size for that duration, and the maximum days for that size. The size input
+increments in 10 GB steps.
+
+`expires_at` is stored on the task. A completed-task alarm deletes the output and
+manifest at that time and keeps the small `.torrent` + task metadata. The UI then
+shows “Files expired and were deleted.” This bounds a short-lived large object
+instead of relying on a background billing system.
+
+The UI shows a quota bar instead of the itemised cost table:
+
+- projected GB-month at the requested keep time, against the 10 GB-month free
+  allowance;
+- room for another download kept for that many days;
+- how many days the free allowance lasts at the current size;
+- how long the current bucket can stay at this pace.
 
 This is a safety policy, not a billing guarantee. Cloudflare's free allowances
 are account-wide and include Workers requests, Durable Object requests/duration,
 SQLite rows, and R2 Class A/B operations; there is no global ledger in this PoC.
-The R2 storage check is the concrete quota enforced per task. Turn the toggle
-off (or send `freeOnly=0`) to bypass the per-task caps; doing so requires the
-admin token.
+The R2 storage check and expiry are the concrete quotas enforced per task. The
+2 GiB output cap is deliberately lower than the billing example because staging
+and the final output coexist; a 200 GB task needs `freeOnly=0` and is **not**
+guaranteed to stay inside the free allowance with this staging design. Turn the
+toggle off (or send `freeOnly=0`) to bypass the per-task caps; doing so requires
+the admin token.
 
 ---
 
@@ -429,7 +467,7 @@ bun run scripts/selftest.ts
 
 It covers bencode, torrent parsing, info hash, file/range selection, bitfield order, tracker compact peers, announce URL encoding, handshake/message framing, BEP 10 bit, piece queue, SHA-1, output-range trimming, and the cost helper.
 
-Current result: **95 assertions passed**.
+Current result: **99 assertions passed**.
 
 ### Real download check
 

@@ -25,6 +25,8 @@ interface TorrentStatus {
   status: string;
   outputKey: string | null;
   manifestKey: string | null;
+  outputDeleted?: boolean;
+  expiresAt?: number | null;
   progress: number;
   verifiedBytes: number;
   wantedBytes: number;
@@ -40,6 +42,7 @@ interface MagnetRequest {
   ranges?: Array<{ start: number; end: number }>;
   autostart?: boolean;
   freeOnly?: boolean;
+  retainHours?: number;
 }
 
 interface ListedObject {
@@ -171,6 +174,10 @@ export default {
         return await stub.fetch("https://do.internal/cleanup", { method: "POST" });
       }
 
+      if (request.method === "POST" && route.action === "expire") {
+        return await stub.fetch("https://do.internal/expire", { method: "POST" });
+      }
+
       if (request.method === "DELETE" && !route.action) {
         return await stub.fetch("https://do.internal/", { method: "DELETE" });
       }
@@ -232,6 +239,7 @@ async function createTorrent(request: Request, env: Env, url: URL): Promise<Resp
       selection,
       autostart: url.searchParams.get("start") !== "0",
       freeOnly: url.searchParams.get("freeOnly") !== "0",
+      retainHours: Number.parseInt(url.searchParams.get("retainHours") ?? "720", 10) || 720,
       extraTrackers,
     }),
   });
@@ -259,6 +267,7 @@ async function createMagnet(request: Request, env: Env): Promise<Response> {
       selection,
       autostart: body.autostart !== false,
       freeOnly: body.freeOnly !== false,
+      retainHours: body.retainHours ?? 720,
       extraTrackers: trackers,
     }),
   });
@@ -368,8 +377,11 @@ async function prepareMagnet(body: MagnetRequest, env: Env) {
 
 async function downloadObject(stub: DurableObjectStub, env: Env): Promise<Response> {
   const status = await readStatus(stub);
-  if (!status || status.status !== "completed" || !status.outputKey) {
+  if (!status || status.status !== "completed") {
     return json({ error: "torrent is not completed yet", status: status?.status ?? "unknown" }, 409);
+  }
+  if (status.outputDeleted || !status.outputKey) {
+    return json({ error: "the output files expired and were deleted" }, 410);
   }
 
   const object = await env.BLOBS.get(status.outputKey);
@@ -386,7 +398,15 @@ async function downloadObject(stub: DurableObjectStub, env: Env): Promise<Respon
 async function downloadManifest(stub: DurableObjectStub, env: Env): Promise<Response> {
   const status = await readStatus(stub);
   if (!status?.manifestKey) {
-    return json({ error: "manifest is not available yet", status: status?.status ?? "unknown" }, 409);
+    return json(
+      {
+        error: status?.outputDeleted
+          ? "the output files expired and were deleted"
+          : "manifest is not available yet",
+        status: status?.status ?? "unknown",
+      },
+      status?.outputDeleted ? 410 : 409,
+    );
   }
 
   const object = await env.BLOBS.get(status.manifestKey);
@@ -431,7 +451,40 @@ async function listFiles(request: Request, env: Env, url: URL): Promise<Response
     totalBytes: all ? result.totalBytes : undefined,
     objectCount: all ? result.objects.length : undefined,
     estimatedStorage: all ? estimateR2Storage(result.totalBytes) : undefined,
+    quota: all ? computeR2Quota(result.objects) : undefined,
   });
+}
+
+function computeR2Quota(objects: ListedObject[]): {
+  allowanceGbMonth: number;
+  accruedGbMonth: number;
+  remainingGbMonth: number;
+  daysAtCurrentSize: number | null;
+  bytes: number;
+} {
+  const now = Date.now();
+  let bytes = 0;
+  let accruedGbMonth = 0;
+  for (const object of objects) {
+    bytes += object.size;
+    const uploaded = Date.parse(object.uploaded);
+    const ageHours = Number.isFinite(uploaded)
+      ? Math.max(0, now - uploaded) / 3_600_000
+      : 0;
+    // R2 storage is billed as the average of the daily peak. Any part of a
+    // calendar day is treated as a full day in this conservative estimate.
+    const ageDays = Math.min(30, Math.max(1, Math.ceil(ageHours / 24)));
+    accruedGbMonth += (object.size / 1e9) * (ageDays / 30);
+  }
+  const remainingGbMonth = Math.max(0, 10 - accruedGbMonth);
+  return {
+    allowanceGbMonth: 10,
+    accruedGbMonth,
+    remainingGbMonth,
+    daysAtCurrentSize:
+      bytes > 0 ? (remainingGbMonth * 30) / (bytes / 1e9) : null,
+    bytes,
+  };
 }
 
 async function r2Cost(env: Env): Promise<Response> {
@@ -441,6 +494,7 @@ async function r2Cost(env: Env): Promise<Response> {
     bytes: result.totalBytes,
     listingCapped: result.listingCapped,
     estimatedStorage: estimateR2Storage(result.totalBytes),
+    quota: computeR2Quota(result.objects),
     pricingAsOf: PRICING_AS_OF,
     note:
       "R2 storage only. Per-task Workers/DO/SQLite estimates are returned in each task status. " +
@@ -598,7 +652,7 @@ function parseTorrentRoute(
 ):
   | {
       id: string;
-      action: "start" | "pause" | "tick" | "download" | "manifest" | "trackers" | "cleanup" | null;
+      action: "start" | "pause" | "tick" | "download" | "manifest" | "trackers" | "cleanup" | "expire" | null;
     }
   | null {
   const parts = pathname.split("/").filter(Boolean);
@@ -609,7 +663,7 @@ function parseTorrentRoute(
   const action = parts.length === 4 ? parts[3] : null;
   if (
     action &&
-    !["start", "pause", "tick", "download", "manifest", "trackers", "cleanup"].includes(action)
+    !["start", "pause", "tick", "download", "manifest", "trackers", "cleanup", "expire"].includes(action)
   ) {
     return null;
   }
@@ -623,6 +677,7 @@ function parseTorrentRoute(
       | "manifest"
       | "trackers"
       | "cleanup"
+      | "expire"
       | null,
   };
 }
@@ -669,6 +724,7 @@ function apiDescription(env: Env): Record<string, unknown> {
       "POST /api/torrents/:infoHash/tick": "run one scheduler cycle immediately (debug)",
       "POST /api/torrents/:infoHash/trackers": "JSON body { urls: [...] } — add HTTP(S) trackers",
       "POST /api/torrents/:infoHash/cleanup": "delete staging objects for a completed transfer",
+      "POST /api/torrents/:infoHash/expire": "delete the output and manifest immediately",
       "GET /api/torrents/:infoHash/download": "stream the completed R2 object",
       "GET /api/torrents/:infoHash/manifest": "download the JSON manifest",
       "DELETE /api/torrents/:infoHash": "delete the session and its R2 objects",

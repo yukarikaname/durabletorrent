@@ -34,7 +34,7 @@ import {
 } from "../src/bittorrent/peer-frames";
 import { PieceQueue } from "../src/bittorrent/piece-queue";
 import { OutputReader, buildOutputRanges } from "../src/storage/output";
-import { estimateR2Storage, estimateTaskCost } from "../src/lib/pricing";
+import { estimateR2Storage, estimateTaskCost, freeRetentionHours } from "../src/lib/pricing";
 
 let passed = 0;
 
@@ -362,6 +362,11 @@ async function main(): Promise<void> {
     const storage = estimateR2Storage(20_000_000_000);
     assert(Math.abs(storage.monthlyCost - 0.3) < 1e-9, "20 GB list price");
     assert(Math.abs(storage.billableMonthlyCost - 0.15) < 1e-9, "billable after 10 GB free");
+
+    assertEqual(freeRetentionHours(3.33, 200_000_000_000, 1), 1, "200 GB / one hour");
+    assertEqual(freeRetentionHours(3.33, 200_000_000_000, 48), 24, "200 GB / second day capped");
+    assertEqual(freeRetentionHours(6.67, 100_000_000_000, 48), 48, "100 GB / two days fits");
+    assertEqual(freeRetentionHours(10, 8_000_000, 24), 24, "small output keeps requested time");
   });
 
   console.log(`\n${passed} assertions passed.`);

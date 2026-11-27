@@ -184,3 +184,24 @@ export function estimateR2Storage(bytes: number): StorageEstimate {
     billableBytes: Math.max(0, safeBytes - PRICING.r2.includedStorageBytes),
   };
 }
+
+/**
+ * Effective retention under the R2 free allowance, using the conservative
+ * daily-peak model. `remainingGbMonth` is what is left after the current output
+ * has already been counted for one day.
+ *
+ * A 200 GB object is ~6.67 GB-month for one day; after that day about 3.33
+ * GB-month remain, so a second day is not free. The result is in hours.
+ */
+export function freeRetentionHours(
+  remainingGbMonth: number,
+  outputBytes: number,
+  requestedHours: number,
+): number {
+  const requested = Math.max(1, Math.floor(requestedHours));
+  const outputGb = Math.max(0, outputBytes) / 1e9;
+  if (outputGb <= 0) return requested;
+  const extraDays = Math.floor((Math.max(0, remainingGbMonth) * 30) / outputGb);
+  const freeTotalDays = Math.max(1, 1 + extraDays);
+  return Math.min(requested, freeTotalDays * 24);
+}

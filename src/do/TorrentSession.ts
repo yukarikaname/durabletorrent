@@ -28,7 +28,7 @@ import {
 } from "../bittorrent/peer-download";
 import { announceTracker } from "../bittorrent/tracker";
 import { normalizeTrackerUrls } from "../bittorrent/tracker-url";
-import { estimateTaskCost } from "../lib/pricing";
+import { estimateTaskCost, freeRetentionHours } from "../lib/pricing";
 import { makePeerId } from "../lib/peer-id";
 import {
   manifestObjectKey,
@@ -67,6 +67,7 @@ interface InitRequest {
   autostart?: boolean;
   extraTrackers?: string[] | string;
   freeOnly?: boolean;
+  retainHours?: number;
 }
 
 interface StoredSelection {
@@ -133,6 +134,8 @@ export class TorrentSession extends DurableObject<Env> {
           return await this.handleTrackers(request);
         case "POST /cleanup":
           return await this.handleCleanup();
+        case "POST /expire":
+          return await this.handleExpire();
         case "DELETE /":
           return await this.handleDelete();
         default:
@@ -160,6 +163,9 @@ export class TorrentSession extends DurableObject<Env> {
       if (task.status === "completed") {
         ran = true;
         if (task.staging_cleaned === 0) await this.cleanupStaging(task);
+        if (task.output_key && task.expires_at && Date.now() >= task.expires_at) {
+          await this.expireOutput(task);
+        }
         return;
       }
       if (task.status === "paused" || task.status === "failed") return;
@@ -212,6 +218,7 @@ export class TorrentSession extends DurableObject<Env> {
     }
 
     const freeOnly = body.freeOnly !== false;
+    const retainHours = clamp(Math.floor(Number(body.retainHours) || 720), 1, 720);
     const wantedPieces = resolved.wantedPieces.count();
     if (freeOnly) {
       if (meta.pieceCount > FREE_LIMITS.maxTotalPieces) {
@@ -265,7 +272,7 @@ export class TorrentSession extends DurableObject<Env> {
     this.ctx.storage.transactionSync(() => {
       this.sql.exec(
         `INSERT INTO task (
-          id, info_hash, name, status, free_only, torrent_key, output_key, manifest_key,
+          id, info_hash, name, status, free_only, retain_hours, expires_at, torrent_key, output_key, manifest_key,
           piece_length, piece_count, total_length, wanted_pieces, wanted_bytes, output_bytes,
           verified_pieces, verified_bytes, downloaded_bytes, wanted_bitmap, verified_bitmap,
           selection_json, files_json, trackers_json, peer_id,
@@ -274,12 +281,14 @@ export class TorrentSession extends DurableObject<Env> {
           created_at, updated_at, started_at, completed_at,
           torrent_bytes, do_requests, alarm_count, wave_duration_ms,
           r2_put_ops, r2_get_ops, tracker_requests, peer_connections, staging_cleaned
-        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
         id,
         exactArrayBuffer(meta.infoHash),
         meta.name,
         status,
         freeOnly ? 1 : 0,
+        retainHours,
+        null,
         body.torrentKey,
         outputKey,
         manifestKey,
@@ -335,13 +344,17 @@ export class TorrentSession extends DurableObject<Env> {
   private handleStatus(url: URL): Response {
     const task = getTask(this.sql);
     if (!task) return json({ error: "torrent session not found" }, 404);
-    if (task.status === "completed" && task.staging_cleaned === 0) {
-      // Old tasks may still have staging objects. Opening the task schedules a
-      // one-shot cleanup, the same path new completions use. Do not reset an
-      // alarm that is already pending.
+    if (task.status === "completed" && (task.staging_cleaned === 0 || (task.output_key && task.expires_at))) {
+      // Old tasks may still have staging objects or a pending expiry. Opening
+      // the task schedules the one-shot work if no alarm is already pending.
       void this.ctx.storage
         .getAlarm()
-        .then((alarm) => (alarm === null ? this.schedule(Date.now() + 100) : undefined))
+        .then((alarm) => {
+          if (alarm !== null) return undefined;
+          if (task.staging_cleaned === 0) return this.schedule(Date.now() + 60_000);
+          if (task.expires_at) return this.schedule(Math.max(Date.now() + 100, task.expires_at));
+          return undefined;
+        })
         .catch(() => undefined);
     }
     return json(this.statusJson(task, url.searchParams.get("bits") === "1"));
@@ -405,6 +418,17 @@ export class TorrentSession extends DurableObject<Env> {
     }
 
     if (task.staging_cleaned === 0) await this.cleanupStaging(task);
+    return json(this.statusJson(getTask(this.sql)!));
+  }
+
+  private async handleExpire(): Promise<Response> {
+    const task = getTask(this.sql);
+    if (!task) return json({ error: "torrent session not found" }, 404);
+    if (task.status !== "completed" || !task.output_key) {
+      return json({ error: "there is no completed output to expire" }, 409);
+    }
+
+    await this.expireOutput(task);
     return json(this.statusJson(getTask(this.sql)!));
   }
 
@@ -1013,9 +1037,21 @@ export class TorrentSession extends DurableObject<Env> {
       const completed = await upload.complete(parts);
       await this.writeManifest(task, ranges, outputKey);
       const now = Date.now();
+      const retainHours = task.retain_hours || 24;
+      let effectiveHours = retainHours;
+      if (task.free_only === 1) {
+        const quota = await this.r2Quota(true);
+        effectiveHours = freeRetentionHours(
+          quota.remainingGbMonth,
+          task.output_bytes,
+          retainHours,
+        );
+      }
+      const expiresAt = now + effectiveHours * 3_600_000;
       this.sql.exec(
-        "UPDATE task SET status='completed', completed_at=?, multipart_upload_id=NULL, multipart_parts_json=NULL, finalize_cursor=?, finalize_part=?, last_error=NULL, r2_put_ops=r2_put_ops+2, updated_at=? WHERE id=?",
+        "UPDATE task SET status='completed', completed_at=?, expires_at=?, multipart_upload_id=NULL, multipart_parts_json=NULL, finalize_cursor=?, finalize_part=?, last_error=NULL, r2_put_ops=r2_put_ops+2, updated_at=? WHERE id=?",
         now,
+        expiresAt,
         task.output_bytes,
         parts.length + 1,
         now,
@@ -1225,22 +1261,56 @@ export class TorrentSession extends DurableObject<Env> {
   }
 
   private async r2UsageBytes(): Promise<number> {
-    let total = 0;
-    for (const prefix of ["torrents/", "downloads/", "staging/"]) {
+    return (await this.r2Quota(false)).bytes;
+  }
+
+  private async r2Quota(excludeStaging: boolean): Promise<{
+    bytes: number;
+    accruedGbMonth: number;
+    remainingGbMonth: number;
+  }> {
+    const now = Date.now();
+    let bytes = 0;
+    let accruedGbMonth = 0;
+    const prefixes = excludeStaging
+      ? ["torrents/", "downloads/"]
+      : ["torrents/", "downloads/", "staging/"];
+    for (const prefix of prefixes) {
       let cursor: string | undefined;
       do {
         const listed = await this.env.BLOBS.list({ prefix, cursor, limit: 1000 });
-        for (const object of listed.objects) total += object.size;
+        for (const object of listed.objects) {
+          bytes += object.size;
+          const ageHours = Math.max(0, now - object.uploaded.getTime()) / 3_600_000;
+          const ageDays = Math.min(30, Math.max(1, Math.ceil(ageHours / 24)));
+          accruedGbMonth += (object.size / 1e9) * (ageDays / 30);
+        }
         cursor = listed.truncated ? listed.cursor : undefined;
       } while (cursor);
     }
-    return total;
+    return {
+      bytes,
+      accruedGbMonth,
+      remainingGbMonth: Math.max(0, 10 - accruedGbMonth),
+    };
   }
 
   private async cleanupStaging(task: TaskRow): Promise<void> {
     await this.deletePrefix(stagingPrefix(task.id));
     this.sql.exec(
       "UPDATE task SET staging_cleaned=1, updated_at=? WHERE id=?",
+      Date.now(),
+      task.id,
+    );
+  }
+
+  private async expireOutput(task: TaskRow): Promise<void> {
+    const keys = [task.output_key, task.manifest_key].filter(
+      (key): key is string => Boolean(key),
+    );
+    if (keys.length > 0) await this.env.BLOBS.delete(keys);
+    this.sql.exec(
+      "UPDATE task SET output_key=NULL, manifest_key=NULL, updated_at=? WHERE id=?",
       Date.now(),
       task.id,
     );
@@ -1263,10 +1333,15 @@ export class TorrentSession extends DurableObject<Env> {
 
     if (task.status === "completed") {
       if (task.staging_cleaned === 0) {
-        await this.schedule(Date.now() + 5 * 60_000);
-      } else {
-        await this.ctx.storage.deleteAlarm();
+        await this.schedule(Date.now() + 60_000);
+        return;
       }
+      if (task.output_key && task.expires_at) {
+        if (Date.now() >= task.expires_at) await this.schedule(Date.now() + 100);
+        else await this.schedule(task.expires_at);
+        return;
+      }
+      await this.ctx.storage.deleteAlarm();
       return;
     }
 
@@ -1314,8 +1389,15 @@ export class TorrentSession extends DurableObject<Env> {
       this.sql,
       "SELECT url FROM tracker ORDER BY tier ASC, url ASC",
     ).map((row) => row.url);
-    const outputStoredBytes = task.status === "completed" ? task.output_bytes : 0;
-    const manifestBytes = task.status === "completed" ? 2048 : 0;
+    const outputStoredBytes =
+      task.status === "completed" && task.output_key ? task.output_bytes : 0;
+    const manifestBytes = task.status === "completed" && task.manifest_key ? 2048 : 0;
+    const effectiveRetainHours =
+      task.expires_at && task.completed_at
+        ? Math.max(0, (task.expires_at - task.completed_at) / 3_600_000)
+        : null;
+    const expiryCapped =
+      effectiveRetainHours !== null && effectiveRetainHours + 0.01 < task.retain_hours;
     const selection = safeJson<StoredSelection>(task.selection_json);
     const allFiles = safeJsonArray<TorrentFile>(task.files_json).map((file) => ({
       ...file,
@@ -1351,6 +1433,11 @@ export class TorrentSession extends DurableObject<Env> {
       name: task.name,
       status: task.status,
       freeOnly: task.free_only === 1,
+      retainHours: task.retain_hours,
+      expiresAt: task.expires_at,
+      effectiveRetainHours,
+      expiryCapped,
+      outputDeleted: task.status === "completed" && !task.output_key,
       pieceLength: task.piece_length,
       pieceCount: task.piece_count,
       totalLength: task.total_length,

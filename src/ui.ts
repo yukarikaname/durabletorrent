@@ -230,6 +230,32 @@ export const UI_HTML = String.raw`<!doctype html>
     color: var(--ink-2);
   }
   .check input { margin-top: 3px; accent-color: var(--ink); }
+  .check ul { margin: 4px 0 0; padding-left: 16px; }
+  .calc { margin-top: 16px; border-top: 1px solid var(--line); padding-top: 12px; }
+  .calc-head { font-family: var(--serif); font-size: 16px; margin-bottom: 4px; }
+  .calc-row { display: flex; gap: 8px; }
+  .calc-row .field { flex: 1; min-width: 0; }
+  .calc-row .input { width: 100%; }
+  .calc-readout {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 8px;
+    margin-top: 12px;
+  }
+  .calc-readout > div { border-top: 2px solid var(--line); padding-top: 6px; }
+  .calc-value { display: block; font-family: var(--serif); font-size: 24px; line-height: 1.05; font-variant-numeric: tabular-nums; }
+  .calc-label { display: block; color: var(--ink-2); font-size: 11px; line-height: 1.3; margin-top: 2px; }
+  .calc-bar {
+    height: 12px;
+    margin-top: 12px;
+    border: 1px solid var(--line-strong);
+    background: #0f141d;
+    position: relative;
+    overflow: hidden;
+  }
+  .calc-bar > i { display: block; height: 100%; width: 0; background: var(--verified); transition: width .2s ease, background .2s ease; }
+  .calc-bar.over > i { background: var(--danger); }
+  .calc-scale { display: flex; justify-content: space-between; color: var(--ink-2); font-size: 10.5px; margin-top: 3px; }
   .busy { min-height: 18px; margin-top: 10px; color: var(--ink-2); font-size: 12px; }
   .busy:not(:empty)::before {
     content: "";
@@ -416,6 +442,16 @@ export const UI_HTML = String.raw`<!doctype html>
   .cost-row .amount { font-variant-numeric: tabular-nums; text-align: right; }
   .cost-units { margin-top: 8px; color: var(--ink-2); font-size: 11.5px; line-height: 1.5; }
 
+  .quota-notice {
+    margin: 8px 0 0;
+    padding: 8px 10px;
+    border-left: 3px solid var(--signal);
+    background: rgba(223, 163, 58, .08);
+    color: var(--ink);
+    font-size: 12.5px;
+    max-width: 80ch;
+  }
+
   .quota { margin-top: 8px; }
   .quota-head { display: flex; justify-content: space-between; gap: 12px; font-size: 12.5px; }
   .quota-bar { height: 10px; border: 1px solid var(--line); background: #0f141d; margin: 6px 0 12px; }
@@ -543,6 +579,25 @@ export const UI_HTML = String.raw`<!doctype html>
           Up to 4 peers, 4,096 pieces, 2 GiB output, 9 GiB R2 bucket budget.</span>
         </label>
         <p class="note">Magnet metadata uses BEP 9 over TCP. Workers has no DHT or UDP tracker support, so a magnet needs an HTTP(S) tracker.</p>
+        <div class="calc">
+          <div class="calc-head">R2 free allowance estimate</div>
+          <div class="calc-row">
+            <label class="field" for="calcSize">File size (GB)
+              <input id="calcSize" class="input" type="number" min="0" step="10" value="200" autocomplete="off">
+            </label>
+            <label class="field" for="calcDays">Keep for (days)
+              <input id="calcDays" class="input" type="number" min="1" max="30" step="1" value="1" autocomplete="off">
+            </label>
+          </div>
+          <div class="calc-readout">
+            <div><span id="calcGbMonth" class="calc-value">6.67</span><span class="calc-label">GB-month</span></div>
+            <div><span id="calcMaxSize" class="calc-value">300</span><span class="calc-label">GB max for 1 day</span></div>
+            <div><span id="calcMaxDays" class="calc-value">1</span><span class="calc-label">day max for 200 GB</span></div>
+          </div>
+          <div class="calc-bar"><i id="calcBar"></i></div>
+          <div class="calc-scale"><span>0</span><span>10 GB-month free</span></div>
+          <p id="calcNote" class="note">Daily-peak estimate.</p>
+        </div>
         <div id="busy" class="busy" role="status" aria-live="polite"></div>
       </section>
 
@@ -563,6 +618,7 @@ export const UI_HTML = String.raw`<!doctype html>
           <div>
             <h1 id="taskName">No transfer yet</h1>
             <p id="taskSub" class="note">Drop a torrent or resolve a magnet to begin.</p>
+            <p id="quotaNotice" class="quota-notice hidden"></p>
           </div>
           <div id="taskStatus" class="status idle" aria-live="polite">
             <span class="status-dot" aria-hidden="true"></span>
@@ -650,6 +706,7 @@ export const UI_HTML = String.raw`<!doctype html>
     adminRequired: false,
     unauthorized: false,
     r2Bytes: 0,
+    quota: null,
     pendingSource: null,
     pendingMagnet: null
   };
@@ -755,6 +812,27 @@ export const UI_HTML = String.raw`<!doctype html>
   function parseTrackers(value) {
     return String(value || "").split(/[,\s]+/).map(function (v) { return v.trim(); })
       .filter(function (v) { return /^https?:\/\//i.test(v); });
+  }
+
+  function updateCalc() {
+    var size = Math.max(0, Number($("calcSize").value) || 0);
+    var days = Math.max(1, Number($("calcDays").value) || 1);
+    var gbMonth = size * days / 30;
+    var maxSize = (10 * 30) / days;
+    var maxDays = size > 0 ? Math.floor((10 * 30) / size) : null;
+    var over = gbMonth > 10.0000001;
+    var percent = Math.max(0, Math.min(100, (gbMonth / 10) * 100));
+
+    $("calcGbMonth").textContent = gbMonth.toFixed(gbMonth > 0 && gbMonth < 0.01 ? 4 : 2);
+    $("calcMaxSize").textContent = maxSize.toFixed(maxSize >= 100 ? 0 : 1);
+    $("calcMaxSize").nextElementSibling.textContent = "GB max for " + days + " day" + (days === 1 ? "" : "s");
+    $("calcMaxDays").textContent = maxDays === null ? "—" : String(maxDays);
+    $("calcMaxDays").nextElementSibling.textContent = "day max for " + size + " GB";
+    $("calcBar").style.width = percent.toFixed(1) + "%";
+    $("calcBar").parentElement.classList.toggle("over", over);
+    $("calcNote").textContent = over
+      ? "Over the 10 GB-month allowance by " + (gbMonth - 10).toFixed(2) + " GB-month. Any part of a day counts as a full day."
+      : "Fits the 10 GB-month allowance. Any part of a day counts as a full day.";
   }
 
   function showInspection(meta, source) {
@@ -1018,7 +1096,31 @@ export const UI_HTML = String.raw`<!doctype html>
     $("taskName").textContent = t.name;
     $("taskSub").textContent = (t.pieceCount || 0) + " pieces of " + bytes(t.pieceLength) +
       ", " + bytes(t.totalLength) + " total. " + countLabel((t.files ? t.files.length : 0), "file", "files") +
-      (t.freeOnly ? " Free-only safeguards on." : " Free-only safeguards off.");
+      (t.freeOnly ? " Free-only safeguards on." : " Free-only safeguards off.") +
+      (t.outputDeleted ? " Files expired and were deleted." : (t.expiresAt ? " Files delete " + date(t.expiresAt) + "." : ""));
+
+    var notice = $("quotaNotice");
+    if (!t.freeOnly) {
+      notice.classList.add("hidden");
+    } else {
+      var noticeText;
+      if (t.outputDeleted) {
+        noticeText = "The free-tier deadline passed. The output and manifest were deleted automatically.";
+      } else if (t.expiresAt) {
+        noticeText = "Free tier: take the file before " + date(t.expiresAt) +
+          ". It will be deleted automatically at that time.";
+      } else {
+        var taskGb = (Number(t.outputBytes) || Number(t.wantedBytes) || 0) / 1e9;
+        var remainingGb = state.quota ? Number(state.quota.remainingGbMonth) : 10;
+        var freeDays = taskGb > 0
+          ? Math.min(30, Math.max(1, Math.floor((remainingGb * 30) / taskGb)))
+          : 30;
+        noticeText = "Free tier estimate: this " + bytes(t.outputBytes || t.wantedBytes) +
+          " result can stay about " + freeDays + " day(s). The exact deadline is fixed when the download completes.";
+      }
+      notice.textContent = noticeText;
+      notice.classList.remove("hidden");
+    }
 
     var status = $("taskStatus");
     status.className = "status " + t.status;
@@ -1049,11 +1151,14 @@ export const UI_HTML = String.raw`<!doctype html>
     if (admin && (t.status === "paused" || t.status === "failed")) {
       actions.push('<button class="button primary" onclick="app.resume()">Resume transfer</button>');
     }
-    if (t.status === "completed") {
+    if (t.status === "completed" && !t.outputDeleted) {
       actions.push('<button class="button primary" onclick="app.download()">Download file</button>');
       actions.push('<button class="button" onclick="app.manifest()">Open manifest</button>');
       if (admin && t.usage && t.usage.stagingBytes > 0) {
         actions.push('<button class="button" onclick="app.cleanup()">Clean staging</button>');
+      }
+      if (admin) {
+        actions.push('<button class="button danger" onclick="app.expire()">Delete files now</button>');
       }
     }
     actions.push('<button class="button quiet" onclick="app.refresh()">Refresh</button>');
@@ -1081,7 +1186,7 @@ export const UI_HTML = String.raw`<!doctype html>
   }
 
   function renderCost(t) {
-    if (t.freeOnly) { renderFreeQuota(); return; }
+    if (t.freeOnly) { renderFreeQuota(t); return; }
     $("costSummary").textContent = "Estimated cost";
     $("costFootnote").classList.remove("hidden");
     if (!t.estimatedCost) { $("cost").innerHTML = '<p class="note">No estimate yet.</p>'; return; }
@@ -1112,32 +1217,57 @@ export const UI_HTML = String.raw`<!doctype html>
     $("cost").innerHTML = html;
   }
 
-  function renderFreeQuota() {
+  function renderFreeQuota(t) {
     $("costSummary").textContent = "Free quota";
     $("costFootnote").classList.add("hidden");
-    var used = Number(state.r2Bytes) || 0;
-    var budget = 9 * 1024 * 1024 * 1024;
-    var percent = Math.min(100, (used / budget) * 100);
-    var remaining = Math.max(0, budget - used);
-    var usedGb = used / 1e9;
-    var days = usedGb > 0 ? (10 / usedGb) * 30 : null;
-    var daysText = days === null ? "—" : (days > 3650 ? "> 10 years" : Math.round(days) + " days");
+    var quota = state.quota || { accruedGbMonth: 0, remainingGbMonth: 10, daysAtCurrentSize: null };
+    var accrued = Number(quota.accruedGbMonth) || 0;
+    var remaining = Number(quota.remainingGbMonth) || 0;
+    var taskGb = (Number(t.outputBytes) || Number(t.wantedBytes) || 0) / 1e9;
+    var retainHours = Number(t.retainHours) || 720;
+    var requestedDays = Math.max(1, Math.ceil(retainHours / 24));
+    var freeTotalDays = taskGb > 0
+      ? Math.max(1, 1 + Math.floor((remaining * 30) / taskGb))
+      : requestedDays;
+    var plannedDays = Math.max(1, Math.min(requestedDays, freeTotalDays));
+    var taskGbMonth = taskGb * plannedDays / 30;
+    // If the output already exists, its current daily peak is already in
+    // accrued; replace that one day with the planned retention instead of
+    // double-counting it.
+    var currentTaskDay = t.outputKey ? taskGb / 30 : 0;
+    var projected = accrued - currentTaskDay + taskGbMonth;
+    var percent = Math.max(0, Math.min(100, (projected / 10) * 100));
+    var freeTotalText = freeTotalDays > 365 ? "> 1 year" : freeTotalDays + " days";
+    var maxSizeForRetention = remaining * 30 / plannedDays;
+    var daysCurrent = quota.daysAtCurrentSize;
+    var daysCurrentText = daysCurrent === null ? "—" :
+      (daysCurrent > 365 ? "> 1 year" : (daysCurrent >= 2 ? Math.round(daysCurrent) + " days" : "< 1 day"));
+    var projectText = projected > 0 && projected < 0.01
+      ? projected.toFixed(4)
+      : projected.toFixed(2);
+    var expiryText = t.outputDeleted
+      ? "Files expired and were deleted."
+      : (t.expiresAt
+        ? "Files delete " + date(t.expiresAt) +
+          (t.expiryCapped ? " (capped by the free allowance)" : "")
+        : "Expiry is scheduled after the output is written.");
 
     $("cost").innerHTML =
       '<div class="quota">' +
-        '<div class="quota-head"><span>R2 storage: ' + bytes(used) + ' of 9 GiB safety budget</span><span>' +
-          percent.toFixed(1) + '%</span></div>' +
+        '<div class="quota-head"><span>Projected R2 storage-time at your keep time</span><span>' +
+          projectText + ' of 10 GB-month</span></div>' +
         '<div class="quota-bar"><i style="width:' + percent.toFixed(1) + '%"></i></div>' +
         '<div class="quota-grid">' +
-          '<div><span class="quota-value">' + bytes(remaining) + '</span>' +
-            '<span class="quota-label">room for another download</span></div>' +
-          '<div><span class="quota-value">' + daysText + '</span>' +
-            '<span class="quota-label">free storage at the current size</span></div>' +
-          '<div><span class="quota-value">10 GB-month</span>' +
-            '<span class="quota-label">Cloudflare R2 monthly free allowance</span></div>' +
+          '<div><span class="quota-value">' + maxSizeForRetention.toFixed(1) + ' GB</span>' +
+            '<span class="quota-label">another download, kept ' + plannedDays + ' day(s)</span></div>' +
+          '<div><span class="quota-value">' + freeTotalText + '</span>' +
+            '<span class="quota-label">free allowance at this size</span></div>' +
+          '<div><span class="quota-value">' + daysCurrentText + '</span>' +
+            '<span class="quota-label">current bucket at this pace</span></div>' +
         '</div>' +
-        '<p class="note">Free-only caps: 2 GiB output, 4 GiB per wave, 4,096 selected pieces, 4 peers, 9 GiB bucket safety budget. ' +
-        'The days figure divides the 10 GB-month allowance by the current bucket size; it is not a bill or a reservation.</p>' +
+        '<p class="note">' + expiryText + ' R2 bills the average of the <strong>daily peak</strong>; any part of a day counts as one day, so a 200 GB file for one hour is not prorated by the hour. ' +
+        'Free-only caps: 2 GiB output, 4 GiB per wave, 4,096 selected pieces, 4 peers. ' +
+        'This is a conservative estimate, not a bill.</p>' +
       '</div>';
   }
 
@@ -1189,6 +1319,7 @@ export const UI_HTML = String.raw`<!doctype html>
     }
     $("storageSummary").textContent = summary + ".";
     state.r2Bytes = Number(data.totalBytes) || 0;
+    state.quota = data.quota || null;
     if (state.lastTask) renderCost(state.lastTask);
   }
 
@@ -1247,6 +1378,16 @@ export const UI_HTML = String.raw`<!doctype html>
         renderTask(await api("/api/torrents/" + state.id + "/cleanup", { method: "POST" }));
         await refreshFiles();
         log("staging cleaned");
+      } catch (e) { setError(e.message); }
+    },
+    expire: async function () {
+      if (!requireAdmin()) return;
+      if (!state.id) return;
+      if (!confirm("Delete the output and manifest now? This cannot be undone.")) return;
+      try {
+        renderTask(await api("/api/torrents/" + state.id + "/expire", { method: "POST" }));
+        await refreshFiles();
+        log("output expired and deleted");
       } catch (e) { setError(e.message); }
     },
     deleteAll: async function () {
@@ -1330,6 +1471,9 @@ export const UI_HTML = String.raw`<!doctype html>
     };
     $("refreshFiles").onclick = function () { refreshFiles().catch(function (e) { setError(e.message); }); };
     $("filePrefix").onchange = function () { refreshFiles().catch(function (e) { setError(e.message); }); };
+    $("calcSize").oninput = updateCalc;
+    $("calcDays").oninput = updateCalc;
+    updateCalc();
 
     var drop = $("drop");
     drop.ondragover = function (event) { event.preventDefault(); drop.classList.add("over"); };
