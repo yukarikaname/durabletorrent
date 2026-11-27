@@ -2,9 +2,6 @@ import { bindings, defineConfig, exports } from "cf/config";
 
 // cf CLI project configuration. This file is the source of truth for `cf dev`,
 // `cf build` and `cf deploy`.
-//
-// If you prefer Wrangler instead, see deploy/wrangler.jsonc. Do not point both
-// tools at the same directory at the same time.
 export default defineConfig({
   worker: {
     name: "durabletorrent",
@@ -33,7 +30,6 @@ export default defineConfig({
     },
 
     observability: { enabled: true },
-    limits: { cpuMs: 30_000 },
     workersDev: true,
   },
 });

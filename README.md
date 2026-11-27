@@ -396,7 +396,7 @@ Counters are best-effort: DO requests and alarm wall time are exact; R2 PUT/GET 
 - **Staging read amplification:** finalization reads overlapping pieces through R2 range GETs; a piece may be read more than once if selected ranges are fragmented.
 - **Large task deletion** can take many R2 list/delete calls (1000 keys per call) and may exceed a request's practical time.
 - **DO SQLite init is O(wanted pieces).** 50,000 piece rows is the PoC cap and can take noticeable CPU.
-- **Free plan CPU is 10 ms.** Use Workers Paid; the config sets `cpuMs: 30000`.
+- **Free plan CPU is 10 ms.** Use Workers Paid for real torrent parsing and SHA-1 verification; the deployed config does not request a custom CPU limit because the Free plan rejects it.
 - **Alarm wall clock is 15 minutes.** Waves are capped at 8 minutes and finalization at 6 minutes.
 - **DO eviction:** in-memory claims/bitfields are lost; SQLite rebuilds them at the next wave. A TCP socket keeps a DO alive for up to 15 minutes.
 - **`cf` CLI 1.0 RC** requires Node 22.23+/24.22+/26.12+ and cannot build under Bun. `cf` command names may change.
@@ -423,3 +423,10 @@ BitTorrent is a legitimate protocol. Download only content you have the rights t
 - BEP 47 — Padding Files and Extended File Properties
 - Cloudflare Docs: Durable Objects SQLite storage, Alarms, TCP sockets, R2 Workers API, R2 multipart, Workers limits, pricing
 - Reference implementations consulted: `webtorrent/bittorrent-protocol`, `webtorrent/parse-torrent`, `webtorrent/bencode`
+
+---
+
+## 13. License
+
+MIT License. Copyright (c) 2026 Yukari Kaname. See [`LICENSE`](LICENSE).
+
