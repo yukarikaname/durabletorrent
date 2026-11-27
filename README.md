@@ -2,6 +2,8 @@
 
 A minimal, outbound-only BitTorrent downloader that runs on **Cloudflare Workers + Durable Objects (SQLite) + R2**.
 
+**Live PoC:** https://durabletorrent.aliciaworks.workers.dev
+
 It is a proof of concept, not a production client. It downloads a selected subset of a torrent, verifies pieces with SHA-1, stages verified pieces in R2, and assembles the final object with R2 multipart upload. It **never accepts inbound connections and never unchokes a peer**, so it cannot seed.
 
 ```
@@ -325,6 +327,21 @@ npx cf auth login
 npx cf deploy
 ```
 
+The Worker, Durable Object and R2 bucket are named `durabletorrent`,
+`TorrentSession`, and `durabletorrent-blobs` in `cloudflare.config.ts`.
+
+### Deploy from GitHub
+
+`.github/workflows/deploy.yml` deploys on every push to `main`:
+
+1. `npm ci`
+2. `npm run typecheck`
+3. `npx cf deploy`
+
+It expects the repository secrets `CLOUDFLARE_API_TOKEN` and
+`CLOUDFLARE_ACCOUNT_ID`. The token only needs Workers Scripts Write, Workers R2
+Storage Write and Workers CI Write on the account. The repository is private.
+
 ### Type generation / typecheck
 
 ```bash
@@ -353,6 +370,19 @@ bun run scripts/selftest.ts
 It covers bencode, torrent parsing, info hash, file/range selection, bitfield order, tracker compact peers, announce URL encoding, handshake/message framing, BEP 10 bit, piece queue, SHA-1, output-range trimming, and the cost helper.
 
 Current result: **95 assertions passed**.
+
+### Real download check
+
+The deployed instance downloaded the first **8,388,607 bytes** of the official
+Debian 13.8.0 amd64 netinst ISO via its torrent (32 of 3,032 pieces, 8 MiB
+selection). The SHA-256 of the R2 output matched the same range fetched from
+`cdimage.debian.org`. It completed in three scheduler waves, used about
+16.1 MiB of R2 storage, and the cost estimate was roughly **$0.00065** at list
+prices. The test task is visible at `/?task=e75a1a6b922815d64cfa9b8904208d3a85143495`
+while it remains in the bucket.
+
+No copyrighted content was downloaded for testing; the Debian ISO is a
+freely redistributable image.
 
 ---
 
