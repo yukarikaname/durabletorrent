@@ -71,3 +71,18 @@ export const LIMITS = {
 
 export const PEER_ID_PREFIX = "-CF0001-";
 export const FAKE_LISTEN_PORT = 6881;
+
+/**
+ * Conservative per-task caps for the Free-only mode. The real Cloudflare free
+ * allowances are account-wide and monthly/daily; these caps keep one task from
+ * consuming a large share of them.
+ */
+export const FREE_LIMITS = {
+  maxTotalPieces: 20_000,
+  maxWantedPieces: 4_096,
+  maxOutputBytes: 2 * 1024 ** 3,
+  maxPieceLength: 2 * 1024 ** 2,
+  maxPeers: 4,
+  maxWaveBytes: 4 * 1024 ** 2,
+  maxBucketBytes: 9 * 1024 ** 3,
+} as const;

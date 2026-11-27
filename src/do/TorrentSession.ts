@@ -9,7 +9,7 @@ import {
   toUint8Array,
 } from "../lib/bytes";
 import { sha1Bytes } from "../lib/hash";
-import { FAKE_LISTEN_PORT, LIMITS } from "../lib/limits";
+import { FAKE_LISTEN_PORT, FREE_LIMITS, LIMITS } from "../lib/limits";
 import { parseTorrent, pieceLengthAt, type TorrentFile, type TorrentMeta } from "../bittorrent/torrent";
 import {
   resolveSelection,
@@ -66,6 +66,7 @@ interface InitRequest {
   selection?: SelectionInput;
   autostart?: boolean;
   extraTrackers?: string[] | string;
+  freeOnly?: boolean;
 }
 
 interface StoredSelection {
@@ -209,6 +210,40 @@ export class TorrentSession extends DurableObject<Env> {
         `selection is ${resolved.outputBytes} bytes; with ${this.r2PartSize}-byte R2 parts the PoC limit is ${maxOutputBytes} bytes (10000 parts)`,
       );
     }
+
+    const freeOnly = body.freeOnly !== false;
+    const wantedPieces = resolved.wantedPieces.count();
+    if (freeOnly) {
+      if (meta.pieceCount > FREE_LIMITS.maxTotalPieces) {
+        throw new Error(
+          `free-only mode allows at most ${FREE_LIMITS.maxTotalPieces} total pieces, this torrent has ${meta.pieceCount}`,
+        );
+      }
+      if (wantedPieces > FREE_LIMITS.maxWantedPieces) {
+        throw new Error(
+          `free-only mode allows at most ${FREE_LIMITS.maxWantedPieces} selected pieces, this selection needs ${wantedPieces}`,
+        );
+      }
+      if (meta.pieceLength > FREE_LIMITS.maxPieceLength) {
+        throw new Error(
+          `free-only mode allows piece lengths up to ${FREE_LIMITS.maxPieceLength} bytes, this torrent uses ${meta.pieceLength}`,
+        );
+      }
+      if (resolved.outputBytes > FREE_LIMITS.maxOutputBytes) {
+        throw new Error(
+          `free-only mode allows output up to ${FREE_LIMITS.maxOutputBytes} bytes, this selection is ${resolved.outputBytes}`,
+        );
+      }
+      const bucketUsage = await this.r2UsageBytes();
+      // Staging and the final output can coexist until cleanup, so reserve two
+      // copies of the output inside the safety budget.
+      if (bucketUsage + resolved.outputBytes * 2 + 2048 > FREE_LIMITS.maxBucketBytes) {
+        throw new Error(
+          `free-only mode keeps this bucket under ${FREE_LIMITS.maxBucketBytes} bytes; current usage is ${bucketUsage}, this output needs about ${resolved.outputBytes * 2} bytes including staging`,
+        );
+      }
+    }
+
     const peerId = makePeerId();
     const outputName = chooseOutputName(meta, resolved);
     const outputKey = outputObjectKey(id, outputName);
@@ -230,7 +265,7 @@ export class TorrentSession extends DurableObject<Env> {
     this.ctx.storage.transactionSync(() => {
       this.sql.exec(
         `INSERT INTO task (
-          id, info_hash, name, status, torrent_key, output_key, manifest_key,
+          id, info_hash, name, status, free_only, torrent_key, output_key, manifest_key,
           piece_length, piece_count, total_length, wanted_pieces, wanted_bytes, output_bytes,
           verified_pieces, verified_bytes, downloaded_bytes, wanted_bitmap, verified_bitmap,
           selection_json, files_json, trackers_json, peer_id,
@@ -239,18 +274,19 @@ export class TorrentSession extends DurableObject<Env> {
           created_at, updated_at, started_at, completed_at,
           torrent_bytes, do_requests, alarm_count, wave_duration_ms,
           r2_put_ops, r2_get_ops, tracker_requests, peer_connections, staging_cleaned
-        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
         id,
         exactArrayBuffer(meta.infoHash),
         meta.name,
         status,
+        freeOnly ? 1 : 0,
         body.torrentKey,
         outputKey,
         manifestKey,
         meta.pieceLength,
         meta.pieceCount,
         meta.totalLength,
-        resolved.wantedPieces.count(),
+        wantedPieces,
         resolved.wantedBytes,
         resolved.outputBytes,
         0,
@@ -464,7 +500,11 @@ export class TorrentSession extends DurableObject<Env> {
       "SELECT * FROM peer WHERE banned_until IS NULL OR banned_until < ? ORDER BY COALESCE(last_seen, 0) DESC LIMIT 100",
       Date.now(),
     );
-    const selected = this.selectPeers(peerRows);
+    const freeOnly = task.free_only === 1;
+    const peerLimit = freeOnly
+      ? Math.min(this.maxPeers, FREE_LIMITS.maxPeers)
+      : this.maxPeers;
+    const selected = this.selectPeers(peerRows, peerLimit);
     if (selected.length > 0) {
       this.sql.exec(
         "UPDATE task SET peer_connections=peer_connections+? WHERE id=?",
@@ -498,7 +538,9 @@ export class TorrentSession extends DurableObject<Env> {
     const claimed = new Set<number>();
     let bytesThisWave = 0;
     let verifiedThisWave = 0;
-    const maxWaveBytes = this.maxWaveBytes;
+    const maxWaveBytes = freeOnly
+      ? Math.min(this.maxWaveBytes, FREE_LIMITS.maxWaveBytes)
+      : this.maxWaveBytes;
 
     const hooks: PeerDownloadHooks = {
       claim: (has): ClaimedPiece | null => {
@@ -798,7 +840,7 @@ export class TorrentSession extends DurableObject<Env> {
     }
   }
 
-  private selectPeers(rows: PeerRow[]): PeerRow[] {
+  private selectPeers(rows: PeerRow[], limit: number): PeerRow[] {
     const now = Date.now();
     const eligible = rows.filter((peer) => !peer.banned_until || peer.banned_until < now);
     shuffle(eligible);
@@ -809,7 +851,7 @@ export class TorrentSession extends DurableObject<Env> {
         (b.last_seen ?? 0) - (a.last_seen ?? 0)
       );
     });
-    return eligible.slice(0, this.maxPeers);
+    return eligible.slice(0, limit);
   }
 
   private recordPeerResult(stats: PeerDownloadStats): void {
@@ -1182,6 +1224,19 @@ export class TorrentSession extends DurableObject<Env> {
     } while (cursor);
   }
 
+  private async r2UsageBytes(): Promise<number> {
+    let total = 0;
+    for (const prefix of ["torrents/", "downloads/", "staging/"]) {
+      let cursor: string | undefined;
+      do {
+        const listed = await this.env.BLOBS.list({ prefix, cursor, limit: 1000 });
+        for (const object of listed.objects) total += object.size;
+        cursor = listed.truncated ? listed.cursor : undefined;
+      } while (cursor);
+    }
+    return total;
+  }
+
   private async cleanupStaging(task: TaskRow): Promise<void> {
     await this.deletePrefix(stagingPrefix(task.id));
     this.sql.exec(
@@ -1295,6 +1350,7 @@ export class TorrentSession extends DurableObject<Env> {
       infoHash: task.id,
       name: task.name,
       status: task.status,
+      freeOnly: task.free_only === 1,
       pieceLength: task.piece_length,
       pieceCount: task.piece_count,
       totalLength: task.total_length,

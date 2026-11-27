@@ -26,6 +26,7 @@ export interface TaskRow extends Record<string, SqlRowValue> {
   info_hash: ArrayBuffer;
   name: string;
   status: TaskStatus;
+  free_only: number;
   torrent_key: string;
   output_key: string | null;
   manifest_key: string | null;
@@ -106,6 +107,7 @@ export function ensureSchema(sql: SqlStorage): void {
       info_hash BLOB NOT NULL,
       name TEXT NOT NULL,
       status TEXT NOT NULL,
+      free_only INTEGER NOT NULL DEFAULT 1,
       torrent_key TEXT NOT NULL,
       output_key TEXT,
       manifest_key TEXT,
@@ -195,6 +197,7 @@ export function ensureSchema(sql: SqlStorage): void {
       .map((row) => String(row.name)),
   );
   const additions: Record<string, string> = {
+    free_only: "INTEGER NOT NULL DEFAULT 1",
     torrent_bytes: "INTEGER NOT NULL DEFAULT 0",
     do_requests: "INTEGER NOT NULL DEFAULT 0",
     alarm_count: "INTEGER NOT NULL DEFAULT 0",

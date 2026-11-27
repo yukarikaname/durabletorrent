@@ -2,7 +2,7 @@
 
 A minimal, outbound-only BitTorrent downloader that runs on **Cloudflare Workers + Durable Objects (SQLite) + R2**.
 
-**Live PoC:** https://durabletorrent.aliciaworks.workers.dev
+**Live PoC:** https://durabletorrent.aliciaworks.workers.dev — public read-only; changes require the admin token.
 
 It is a proof of concept, not a production client. It downloads a selected subset of a torrent, verifies pieces with SHA-1, stages verified pieces in R2, and assembles the final object with R2 multipart upload. It **never accepts inbound connections and never unchokes a peer**, so it cannot seed.
 
@@ -225,15 +225,16 @@ Workers limits each invocation to **6 simultaneous outbound connection attempts*
 `GET /` serves **DurableTorrent**, a single-page UI built around a live piece map:
 
 - Drag a `.torrent` file or a magnet link onto the drop zone.
-- Inspect the torrent, choose files, then start the download.
+- Inspect a `.torrent` or resolve a magnet's metadata first, then choose exactly which files to download.
 - Paste a magnet link; extra trackers can be supplied if the magnet has none.
 - Watch verified pieces fill the map in amber, along with peers, trackers, bytes and storage.
+- Use the **Free-only safeguards** toggle (on by default) to keep one task and the R2 bucket inside conservative free-tier caps.
 - Add HTTP(S) trackers to a running task.
 - Download the completed output or its manifest.
 - Staging is merged into the output and deleted automatically; a manual "Clean staging" action is available for older tasks.
 - Browse/delete individual R2 objects, or use "Delete all" to remove every task and object.
-- See a rough cost estimate for the task and for R2 storage.
-- Optional API token stored in `localStorage`.
+- In free mode, see a storage quota bar and how many days the current data fits in the R2 free allowance; otherwise see a rough cost estimate.
+- Optional admin token stored in `localStorage`; readers can browse without it.
 - Open `/?task=<infoHash>` to return to a transfer by its info hash.
 
 The visual direction follows Anthropic's open-source
@@ -267,6 +268,7 @@ Other endpoints:
 
 ```text
 POST   /api/torrents/inspect          parse a .torrent and return its file list
+POST   /api/magnets/inspect           resolve magnet metadata and return its file list
 GET    /api/torrents/:infoHash        status + usage + estimatedCost
 GET    /api/torrents/:infoHash?bits=1 status + hex verified bitfield
 POST   /api/torrents/:infoHash/start
@@ -286,13 +288,63 @@ GET    /health
 GET    /api                            API description
 ```
 
-Authentication is optional. Set `API_TOKEN` as a Worker secret; then send:
+### Read-only public access
+
+Reads are public:
+
+- the UI at `/`
+- `GET /api`, `GET /api/torrents/:id`, `GET /api/torrents/:id?bits=1`
+- `GET /api/torrents/:id/download`, `GET /api/torrents/:id/manifest`
+- `GET /api/files`, `GET /api/files/object`, `GET /api/cost`
+
+Every mutation requires an admin token:
 
 ```text
-Authorization: Bearer <token>
+Authorization: Bearer <API_TOKEN>
 ```
 
-Browser download links cannot set an Authorization header. For read-only download routes, the Worker also accepts `?token=<token>`. This puts the token in URLs and logs; use it only for the PoC.
+That covers all `POST` routes (create torrent, magnet, start, pause, tick,
+trackers, cleanup, inspect) and all `DELETE` routes (task, R2 object, delete all).
+`GET /api` reports the current mode in `auth.mutations` (`admin-token` or `open`).
+
+The UI's **Admin token for changes** box stores the token in `localStorage` and
+attaches the header. Read-only visitors see the piece map, status, files and
+downloads, but the start/pause/delete/tracker controls are disabled. If
+`API_TOKEN` is not configured, mutations are open.
+
+### Free-only safeguards
+
+The UI toggle is on by default, and the Worker also defaults `freeOnly` to true
+when the flag is absent. It applies conservative caps:
+
+| Resource | Free-only cap |
+|---|---|
+| Output per task | 2 GiB |
+| Selected pieces per task | 4,096 |
+| Total pieces in the torrent | 20,000 |
+| Piece length | 2 MiB |
+| Peers per wave | 4 |
+| Verified bytes per wave | 4 MiB |
+| R2 bucket usage before a new task | 9 GiB safety budget |
+
+Before creating a task, the Durable Object sums R2 objects and rejects the
+selection if `current usage + staging + output + manifest` would exceed the
+9 GiB safety budget. Staging is counted as roughly one extra copy of the output,
+because it coexists with the final object until cleanup. The UI shows a quota bar instead of the itemised cost table:
+
+- storage used against the 9 GiB safety budget;
+- room for another download after staging is cleaned up (staging temporarily
+  needs about a second copy of the output);
+- how many days the current bucket size lasts under the **10 GB-month** R2
+  free allowance (`10 / used GB × 30 days`);
+- the 10 GB-month free allowance itself.
+
+This is a safety policy, not a billing guarantee. Cloudflare's free allowances
+are account-wide and include Workers requests, Durable Object requests/duration,
+SQLite rows, and R2 Class A/B operations; there is no global ledger in this PoC.
+The R2 storage check is the concrete quota enforced per task. Turn the toggle
+off (or send `freeOnly=0`) to bypass the per-task caps; doing so requires the
+admin token.
 
 ---
 
@@ -353,11 +405,15 @@ npx cf workers types
 npm run typecheck
 ```
 
-### Optional API token
+### Admin token
 
 ```bash
 npx cf workers secrets update API_TOKEN --text '<your-token>' --worker durabletorrent
 ```
+
+This is the Worker's admin token, not the `CLOUDFLARE_API_TOKEN` used by
+GitHub Actions. Setting it makes the deployment read-only for everyone without
+the token.
 
 `cf` command names can change during the 1.0 RC; run `npx cf cli search "..."` or `npx cf --help` if a command differs.
 
@@ -439,8 +495,9 @@ Counters are best-effort: DO requests and alarm wall time are exact; R2 PUT/GET 
 
 ### UI / security
 
-- The UI is same-origin and stores the API token in `localStorage`. That is convenient for a PoC, not a hardened admin console.
-- The `?token=` download fallback leaks the token into browser history and access logs.
+- The UI is same-origin and stores the admin token in `localStorage`. That is convenient for a PoC, not a hardened admin console.
+- There is one shared admin token, not per-user accounts. Anyone with the token can change everything.
+- If `API_TOKEN` is unset, mutations are open to anyone with the URL.
 - Tracker URLs and peer endpoints are user/tracker supplied. The runtime blocks private/Cloudflare IPs and the code filters obvious private ranges, but this is not a substitute for an allowlist in a public deployment.
 - Torrent filenames are sanitized for R2 keys, but the manifest preserves the original path strings for display.
 

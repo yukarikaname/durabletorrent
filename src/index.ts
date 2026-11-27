@@ -1,5 +1,5 @@
 import type { Env } from "./env";
-import { LIMITS } from "./lib/limits";
+import { FREE_LIMITS, LIMITS } from "./lib/limits";
 import { readRequestBodyCapped } from "./lib/http";
 import { parseTorrent } from "./bittorrent/torrent";
 import {
@@ -39,6 +39,7 @@ interface MagnetRequest {
   files?: number[];
   ranges?: Array<{ start: number; end: number }>;
   autostart?: boolean;
+  freeOnly?: boolean;
 }
 
 interface ListedObject {
@@ -79,10 +80,15 @@ export default {
     }
 
     if (url.pathname === "/api" || url.pathname === "/api/") {
-      return json(apiDescription());
+      return json(apiDescription(env));
     }
 
-    if (url.pathname.startsWith("/api/") && env.API_TOKEN && !authorized(request, url, env)) {
+    if (
+      url.pathname.startsWith("/api/") &&
+      env.API_TOKEN &&
+      !["GET", "HEAD", "OPTIONS"].includes(request.method) &&
+      !authorized(request, env)
+    ) {
       return json({ error: "unauthorized" }, 401);
     }
 
@@ -93,6 +99,10 @@ export default {
 
       if (request.method === "POST" && url.pathname === "/api/torrents") {
         return await createTorrent(request, env, url);
+      }
+
+      if (request.method === "POST" && url.pathname === "/api/magnets/inspect") {
+        return await inspectMagnet(request, env);
       }
 
       if (request.method === "POST" && url.pathname === "/api/magnets") {
@@ -221,6 +231,7 @@ async function createTorrent(request: Request, env: Env, url: URL): Promise<Resp
       torrentKey,
       selection,
       autostart: url.searchParams.get("start") !== "0",
+      freeOnly: url.searchParams.get("freeOnly") !== "0",
       extraTrackers,
     }),
   });
@@ -228,35 +239,8 @@ async function createTorrent(request: Request, env: Env, url: URL): Promise<Resp
 
 async function createMagnet(request: Request, env: Env): Promise<Response> {
   const body = (await request.json()) as MagnetRequest;
-  const magnet = parseMagnet(String(body.magnet ?? ""));
-  const trackers = normalizeTrackerUrls([
-    ...magnet.trackers,
-    ...normalizeTrackerUrls(body.trackers),
-  ]);
-  if (trackers.length === 0) {
-    return json(
-      {
-        error:
-          "magnet has no HTTP(S) tracker; DHT is not available on Workers, so add a tracker URL explicitly",
-      },
-      400,
-    );
-  }
-
-  const peerId = makePeerId();
-  const metadata = await fetchMetadata({
-    infoHash: magnet.infoHash,
-    trackers,
-    peerId,
-    timeoutMs: 45_000,
-    log: (message) => console.log("[magnet]", message),
-  });
-
-  const torrent = buildTorrentFromInfo(metadata.infoBytes, trackers);
-  const meta = await parseTorrent(torrent);
-  if (meta.infoHashHex !== magnet.infoHashHex) {
-    return json({ error: "magnet metadata does not match the requested info hash" }, 400);
-  }
+  const prepared = await prepareMagnet(body, env);
+  const { magnet, meta, trackers } = prepared;
 
   const selection: SelectionInput = {
     files: body.files,
@@ -265,15 +249,6 @@ async function createMagnet(request: Request, env: Env): Promise<Response> {
   resolveSelection(meta, selection);
 
   const torrentKey = torrentObjectKey(meta.infoHashHex);
-  await env.BLOBS.put(torrentKey, torrent, {
-    httpMetadata: { contentType: "application/x-bittorrent" },
-    customMetadata: {
-      infoHash: meta.infoHashHex,
-      name: meta.name,
-      source: "magnet",
-    },
-  });
-
   const stub = env.TORRENT_SESSION.getByName(meta.infoHashHex);
   const initialized = await stub.fetch("https://do.internal/init", {
     method: "POST",
@@ -283,6 +258,7 @@ async function createMagnet(request: Request, env: Env): Promise<Response> {
       torrentKey,
       selection,
       autostart: body.autostart !== false,
+      freeOnly: body.freeOnly !== false,
       extraTrackers: trackers,
     }),
   });
@@ -299,11 +275,91 @@ async function createMagnet(request: Request, env: Env): Promise<Response> {
   return json({
     ...data,
     magnet: {
-      metadataPeer: `${metadata.peerHost}:${metadata.peerPort}`,
-      peersDiscovered: metadata.peerCount,
+      metadataPeer: prepared.metadataPeer ?? null,
+      peersDiscovered: prepared.metadataPeers ?? 0,
+      cached: !prepared.fetched,
       trackers,
     },
   });
+}
+
+async function inspectMagnet(request: Request, env: Env): Promise<Response> {
+  const body = (await request.json()) as MagnetRequest;
+  const prepared = await prepareMagnet(body, env);
+  const meta = prepared.meta;
+  return json({
+    infoHash: meta.infoHashHex,
+    name: meta.name,
+    pieceLength: meta.pieceLength,
+    pieceCount: meta.pieceCount,
+    totalLength: meta.totalLength,
+    files: meta.files,
+    trackers: prepared.trackers,
+    source: "magnet",
+    cached: !prepared.fetched,
+  });
+}
+
+async function prepareMagnet(body: MagnetRequest, env: Env) {
+  const magnet = parseMagnet(String(body.magnet ?? ""));
+  const trackers = normalizeTrackerUrls([
+    ...magnet.trackers,
+    ...normalizeTrackerUrls(body.trackers),
+  ]);
+  if (trackers.length === 0) {
+    throw new Error(
+      "magnet has no HTTP(S) tracker; DHT is not available on Workers, so add a tracker URL explicitly",
+    );
+  }
+
+  const torrentKey = torrentObjectKey(magnet.infoHashHex);
+  const existing = await env.BLOBS.get(torrentKey);
+  if (existing) {
+    const torrent = new Uint8Array(await existing.arrayBuffer());
+    const meta = await parseTorrent(torrent);
+    if (meta.infoHashHex !== magnet.infoHashHex) {
+      throw new Error("stored magnet torrent does not match the requested info hash");
+    }
+    return {
+      magnet,
+      trackers: normalizeTrackerUrls([...meta.trackers, ...trackers]),
+      meta,
+      fetched: false,
+      metadataPeer: undefined,
+      metadataPeers: undefined,
+    };
+  }
+
+  const metadata = await fetchMetadata({
+    infoHash: magnet.infoHash,
+    trackers,
+    peerId: makePeerId(),
+    timeoutMs: 45_000,
+    log: (message) => console.log("[magnet]", message),
+  });
+  const torrent = buildTorrentFromInfo(metadata.infoBytes, trackers);
+  const meta = await parseTorrent(torrent);
+  if (meta.infoHashHex !== magnet.infoHashHex) {
+    throw new Error("magnet metadata does not match the requested info hash");
+  }
+
+  await env.BLOBS.put(torrentKey, torrent, {
+    httpMetadata: { contentType: "application/x-bittorrent" },
+    customMetadata: {
+      infoHash: meta.infoHashHex,
+      name: meta.name,
+      source: "magnet",
+    },
+  });
+
+  return {
+    magnet,
+    trackers: normalizeTrackerUrls([...meta.trackers, ...trackers]),
+    meta,
+    fetched: true,
+    metadataPeer: `${metadata.peerHost}:${metadata.peerPort}`,
+    metadataPeers: metadata.peerCount,
+  };
 }
 
 // -----------------------------------------------------------------------------
@@ -571,19 +627,8 @@ function parseTorrentRoute(
   };
 }
 
-function authorized(request: Request, url: URL, env: Env): boolean {
-  if (request.headers.get("authorization") === `Bearer ${env.API_TOKEN}`) return true;
-  // Browser download links cannot attach an Authorization header. Permit a
-  // query token only for read-only GET routes, and document it.
-  if (
-    request.method === "GET" &&
-    (url.pathname === "/api/files/object" ||
-      url.pathname.endsWith("/download") ||
-      url.pathname.endsWith("/manifest"))
-  ) {
-    return url.searchParams.get("token") === env.API_TOKEN;
-  }
-  return false;
+function authorized(request: Request, env: Env): boolean {
+  return Boolean(env.API_TOKEN) && request.headers.get("authorization") === `Bearer ${env.API_TOKEN}`;
 }
 
 function keyAllowed(key: string): boolean {
@@ -601,17 +646,22 @@ function contentDisposition(name: string): string {
   return `attachment; filename="${ascii}"; filename*=UTF-8''${encodeURIComponent(name)}`;
 }
 
-function apiDescription(): Record<string, unknown> {
+function apiDescription(env: Env): Record<string, unknown> {
   return {
     name: "durabletorrent",
     description:
       "Minimal outbound-only BitTorrent downloader on Workers + Durable Objects (SQLite) + R2.",
+    auth: {
+      reads: "public",
+      mutations: env.API_TOKEN ? "admin-token" : "open",
+    },
     endpoints: {
       "GET /": "drag-and-drop UI",
       "POST /api/torrents/inspect": "parse a .torrent and return its files without creating a task",
       "POST /api/torrents?files=0,2&ranges=0-1048575&trackers=https://...&start=1":
         "upload a .torrent as the raw request body",
       "POST /api/magnets": "JSON body { magnet, trackers?, files?, ranges? } — resolves BEP 9 metadata",
+      "POST /api/magnets/inspect": "resolve magnet metadata and return its files for selection",
       "GET /api/torrents/:infoHash": "task status (includes estimatedCost)",
       "GET /api/torrents/:infoHash?bits=1": "status plus the verified piece bitfield",
       "POST /api/torrents/:infoHash/start": "resume a paused/queued task",
@@ -635,6 +685,7 @@ function apiDescription(): Record<string, unknown> {
       maxPieceLength: LIMITS.maxPieceLength,
       maxPeers: LIMITS.maxPeers,
     },
+    freeOnly: FREE_LIMITS,
   };
 }
 

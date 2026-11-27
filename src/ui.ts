@@ -97,6 +97,9 @@ export const UI_HTML = String.raw`<!doctype html>
   .access { min-width: 240px; }
   .access label { display: block; font-size: 12px; color: var(--ink-2); margin-bottom: 4px; }
   .access-row { display: flex; gap: 6px; }
+  .auth-note { font-size: 11.5px; line-height: 1.4; margin-top: 5px; color: var(--ink-2); }
+  .auth-note.readonly { color: var(--danger); }
+  .auth-note.admin { color: var(--verified); }
 
   .input {
     width: 100%;
@@ -218,6 +221,15 @@ export const UI_HTML = String.raw`<!doctype html>
     max-width: 62ch;
   }
 
+  .check {
+    display: flex;
+    gap: 7px;
+    align-items: flex-start;
+    margin-top: 14px;
+    font-size: 12px;
+    color: var(--ink-2);
+  }
+  .check input { margin-top: 3px; accent-color: var(--ink); }
   .busy { min-height: 18px; margin-top: 10px; color: var(--ink-2); font-size: 12px; }
   .busy:not(:empty)::before {
     content: "";
@@ -404,6 +416,14 @@ export const UI_HTML = String.raw`<!doctype html>
   .cost-row .amount { font-variant-numeric: tabular-nums; text-align: right; }
   .cost-units { margin-top: 8px; color: var(--ink-2); font-size: 11.5px; line-height: 1.5; }
 
+  .quota { margin-top: 8px; }
+  .quota-head { display: flex; justify-content: space-between; gap: 12px; font-size: 12.5px; }
+  .quota-bar { height: 10px; border: 1px solid var(--line); background: #0f141d; margin: 6px 0 12px; }
+  .quota-bar > i { display: block; height: 100%; background: var(--signal); width: 0; }
+  .quota-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; }
+  .quota-value { display: block; font-family: var(--serif); font-size: 21px; line-height: 1.1; }
+  .quota-label { display: block; color: var(--ink-2); font-size: 11.5px; margin-top: 2px; }
+
   .storage { margin-top: 34px; border-top: 1px solid var(--line-strong); padding-top: 14px; }
   .section-head {
     display: flex;
@@ -484,11 +504,12 @@ export const UI_HTML = String.raw`<!doctype html>
       </div>
     </div>
     <div class="access">
-      <label for="token">API token, if the Worker requires one</label>
+      <label for="token">Admin token for changes</label>
       <div class="access-row">
         <input id="token" class="input" type="password" autocomplete="off" placeholder="Optional">
         <button id="saveToken" class="button small">Save</button>
       </div>
+      <div id="authNote" class="auth-note"></div>
     </div>
   </header>
 
@@ -515,6 +536,11 @@ export const UI_HTML = String.raw`<!doctype html>
 
         <label class="field" for="trackers">Trackers to add
           <textarea id="trackers" class="input" rows="2" placeholder="One URL per line, or comma separated"></textarea>
+        </label>
+        <label class="check">
+          <input id="freeOnly" type="checkbox" checked>
+          <span><strong>Free-only safeguards</strong><br>
+          Up to 4 peers, 4,096 pieces, 2 GiB output, 9 GiB R2 bucket budget.</span>
         </label>
         <p class="note">Magnet metadata uses BEP 9 over TCP. Workers has no DHT or UDP tracker support, so a magnet needs an HTTP(S) tracker.</p>
         <div id="busy" class="busy" role="status" aria-live="polite"></div>
@@ -573,9 +599,9 @@ export const UI_HTML = String.raw`<!doctype html>
         </details>
 
         <details class="drawer" open>
-          <summary>Estimated cost</summary>
+          <summary id="costSummary">Estimated cost</summary>
           <div id="cost" class="cost"></div>
-          <p class="note">List prices, not an invoice. Free allowances are account-wide, and the $5 monthly Workers plan base is excluded.</p>
+          <p id="costFootnote" class="note">List prices, not an invoice. Free allowances are account-wide, and the $5 monthly Workers plan base is excluded.</p>
         </details>
       </section>
 
@@ -590,7 +616,7 @@ export const UI_HTML = String.raw`<!doctype html>
               <option value="staging/">staging/</option>
             </select>
             <button id="refreshFiles" class="button">Refresh</button>
-            <button class="button small danger" onclick="app.deleteAll()">Delete all</button>
+            <button id="deleteAll" class="button small danger" onclick="app.deleteAll()">Delete all</button>
           </div>
         </div>
         <p id="storageSummary" class="note"></p>
@@ -620,7 +646,12 @@ export const UI_HTML = String.raw`<!doctype html>
     pendingFile: null,
     pendingMeta: null,
     lastTask: null,
-    token: ""
+    token: "",
+    adminRequired: false,
+    unauthorized: false,
+    r2Bytes: 0,
+    pendingSource: null,
+    pendingMagnet: null
   };
 
   function $(id) { return document.getElementById(id); }
@@ -666,6 +697,42 @@ export const UI_HTML = String.raw`<!doctype html>
     });
   }
 
+  function canAdmin() {
+    return !state.adminRequired || Boolean(state.token);
+  }
+
+  function requireAdmin() {
+    if (canAdmin()) return true;
+    setError("Read-only: save the admin token to make changes.");
+    return false;
+  }
+
+  function updateAuthUi() {
+    var note = $("authNote");
+    if (state.unauthorized) {
+      note.textContent = "The saved token was rejected. Read-only until a valid admin token is saved.";
+      note.className = "auth-note readonly";
+    } else if (state.adminRequired) {
+      if (state.token) {
+        note.textContent = "Admin token saved. Changes are enabled.";
+        note.className = "auth-note admin";
+      } else {
+        note.textContent = "Read-only. Browsing and downloads are public; save the admin token to make changes.";
+        note.className = "auth-note readonly";
+      }
+    } else {
+      note.textContent = "Changes are open on this deployment.";
+      note.className = "auth-note";
+    }
+
+    var allowed = canAdmin();
+    ["browse", "addMagnet", "startSelected", "addTracker", "newTracker", "deleteAll", "freeOnly"].forEach(function (id) {
+      var element = $(id);
+      if (element) element.disabled = !allowed;
+    });
+    if (state.lastTask) renderTask(state.lastTask);
+  }
+
   async function api(path, options) {
     options = options || {};
     var headers = Object.assign({}, options.headers || {});
@@ -675,7 +742,11 @@ export const UI_HTML = String.raw`<!doctype html>
     var data = null;
     try { data = text ? JSON.parse(text) : null; } catch (e) { data = { error: text }; }
     if (!response.ok) {
-      if (response.status === 401) log("401: set the API token at the top of the page");
+      if (response.status === 401) {
+        state.unauthorized = true;
+        updateAuthUi();
+        throw new Error("Read-only: save a valid admin token to make changes.");
+      }
       throw new Error(data && data.error ? data.error : "HTTP " + response.status);
     }
     return data;
@@ -686,9 +757,31 @@ export const UI_HTML = String.raw`<!doctype html>
       .filter(function (v) { return /^https?:\/\//i.test(v); });
   }
 
+  function showInspection(meta, source) {
+    state.pendingMeta = meta;
+    state.pendingSource = source;
+    $("inspectMeta").textContent = (source === "magnet" ? "Magnet metadata: " : "Torrent: ") +
+      meta.name + " has " + countLabel(meta.files.length, "file", "files") + " and " +
+      meta.pieceCount + " pieces of " + bytes(meta.pieceLength) + ". " + bytes(meta.totalLength) + " total.";
+    $("fileList").innerHTML = meta.files.map(function (f) {
+      return '<label><input type="checkbox" value="' + f.index + '"' + (f.padding ? "" : " checked") +
+        (f.padding ? " disabled" : "") + '>' +
+        '<span><span class="file-path">' + esc(f.path) + '</span><br>' +
+        '<span class="file-meta">' + bytes(f.length) + (f.padding ? ", padding file" : "") + '</span></span></label>';
+    }).join("") || '<p class="note">No files.</p>';
+    $("inspect").classList.remove("hidden");
+    step("stepAdd");
+    $("inspect").scrollIntoView({ behavior: "smooth", block: "nearest" });
+  }
+
   async function inspectFile(file) {
+    if (!canAdmin()) {
+      setError("Read-only: save the admin token to add transfers.");
+      return;
+    }
     if (!file) return;
     state.pendingFile = file;
+    state.pendingMagnet = null;
     setBusy("Reading " + file.name + "...");
     setError("");
     try {
@@ -697,18 +790,7 @@ export const UI_HTML = String.raw`<!doctype html>
         headers: { "content-type": "application/x-bittorrent" },
         body: file
       });
-      state.pendingMeta = meta;
-      $("inspectMeta").textContent = meta.name + " has " + countLabel(meta.files.length, "file", "files") + " and " +
-        meta.pieceCount + " pieces of " + bytes(meta.pieceLength) + ". " + bytes(meta.totalLength) + " total.";
-      $("fileList").innerHTML = meta.files.map(function (f) {
-        return '<label><input type="checkbox" value="' + f.index + '"' + (f.padding ? "" : " checked") +
-          (f.padding ? " disabled" : "") + '>' +
-          '<span><span class="file-path">' + esc(f.path) + '</span><br>' +
-          '<span class="file-meta">' + bytes(f.length) + (f.padding ? ", padding file" : "") + '</span></span></label>';
-      }).join("") || '<p class="note">No files.</p>';
-      $("inspect").classList.remove("hidden");
-      step("stepAdd");
-      $("inspect").scrollIntoView({ behavior: "smooth", block: "nearest" });
+      showInspection(meta, "torrent");
       log("read " + meta.name + ", info hash " + meta.infoHash);
     } catch (error) {
       setError(error.message);
@@ -719,25 +801,47 @@ export const UI_HTML = String.raw`<!doctype html>
   }
 
   async function startSelected() {
-    if (!state.pendingFile) return;
+    if (!canAdmin()) {
+      setError("Read-only: save the admin token to start a transfer.");
+      return;
+    }
+    if (!state.pendingFile && !state.pendingMagnet) return;
     var checked = Array.prototype.slice.call(document.querySelectorAll("#fileList input[type=checkbox]:checked"));
     var files = checked.map(function (cb) { return Number(cb.value); });
     if (files.length === 0) { setError("Choose at least one file."); return; }
 
     var trackers = parseTrackers($("trackers").value);
-    var qs = new URLSearchParams();
-    qs.set("files", files.join(","));
-    if (trackers.length) qs.set("trackers", trackers.join(","));
-
+    var freeOnly = $("freeOnly").checked;
     setBusy("Creating the transfer...");
     setError("");
     try {
-      var task = await api("/api/torrents?" + qs.toString(), {
-        method: "POST",
-        headers: { "content-type": "application/x-bittorrent" },
-        body: state.pendingFile
-      });
+      var task;
+      if (state.pendingSource === "magnet" && state.pendingMagnet) {
+        task = await api("/api/magnets", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            magnet: state.pendingMagnet,
+            trackers: trackers,
+            files: files,
+            freeOnly: freeOnly
+          })
+        });
+      } else {
+        var qs = new URLSearchParams();
+        qs.set("files", files.join(","));
+        qs.set("freeOnly", freeOnly ? "1" : "0");
+        if (trackers.length) qs.set("trackers", trackers.join(","));
+        task = await api("/api/torrents?" + qs.toString(), {
+          method: "POST",
+          headers: { "content-type": "application/x-bittorrent" },
+          body: state.pendingFile
+        });
+      }
       $("inspect").classList.add("hidden");
+      state.pendingFile = null;
+      state.pendingMagnet = null;
+      state.pendingSource = null;
       setCurrent(task);
       log("created transfer " + task.id);
     } catch (error) {
@@ -749,19 +853,25 @@ export const UI_HTML = String.raw`<!doctype html>
   }
 
   async function addMagnet() {
+    if (!canAdmin()) {
+      setError("Read-only: save the admin token to add a magnet.");
+      return;
+    }
     var magnet = $("magnet").value.trim();
     if (!magnet) { setError("Paste a magnet link first."); return; }
     var trackers = parseTrackers($("trackers").value);
-    setBusy("Looking for metadata in the swarm. This can take up to about 45 seconds.");
+    setBusy("Fetching magnet metadata, then you can choose files. This can take up to about 45 seconds.");
     setError("");
     try {
-      var task = await api("/api/magnets", {
+      var meta = await api("/api/magnets/inspect", {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ magnet: magnet, trackers: trackers })
       });
-      setCurrent(task);
-      log("magnet resolved through " + (task.magnet ? task.magnet.metadataPeer : "a peer"));
+      state.pendingMagnet = magnet;
+      state.pendingFile = null;
+      showInspection(meta, "magnet");
+      log("magnet metadata ready; choose files before starting");
     } catch (error) {
       setError(error.message);
       log("magnet failed: " + error.message);
@@ -907,7 +1017,8 @@ export const UI_HTML = String.raw`<!doctype html>
     state.lastTask = t;
     $("taskName").textContent = t.name;
     $("taskSub").textContent = (t.pieceCount || 0) + " pieces of " + bytes(t.pieceLength) +
-      ", " + bytes(t.totalLength) + " total. " + countLabel((t.files ? t.files.length : 0), "file", "files") + ".";
+      ", " + bytes(t.totalLength) + " total. " + countLabel((t.files ? t.files.length : 0), "file", "files") +
+      (t.freeOnly ? " Free-only safeguards on." : " Free-only safeguards off.");
 
     var status = $("taskStatus");
     status.className = "status " + t.status;
@@ -930,22 +1041,25 @@ export const UI_HTML = String.raw`<!doctype html>
         '</span><span class="readout-label">' + esc(item[1]) + '</span></div>';
     }).join("");
 
+    var admin = canAdmin();
     var actions = [];
-    if (t.status === "downloading" || t.status === "finalizing") {
+    if (admin && (t.status === "downloading" || t.status === "finalizing")) {
       actions.push('<button class="button" onclick="app.pause()">Pause transfer</button>');
     }
-    if (t.status === "paused" || t.status === "failed") {
+    if (admin && (t.status === "paused" || t.status === "failed")) {
       actions.push('<button class="button primary" onclick="app.resume()">Resume transfer</button>');
     }
     if (t.status === "completed") {
       actions.push('<button class="button primary" onclick="app.download()">Download file</button>');
       actions.push('<button class="button" onclick="app.manifest()">Open manifest</button>');
-      if (t.usage && t.usage.stagingBytes > 0) {
+      if (admin && t.usage && t.usage.stagingBytes > 0) {
         actions.push('<button class="button" onclick="app.cleanup()">Clean staging</button>');
       }
     }
     actions.push('<button class="button quiet" onclick="app.refresh()">Refresh</button>');
-    actions.push('<button class="button danger" onclick="app.remove()">Delete transfer</button>');
+    if (admin) {
+      actions.push('<button class="button danger" onclick="app.remove()">Delete transfer</button>');
+    }
     $("actions").innerHTML = actions.join("");
 
     setError(t.lastError || "");
@@ -967,6 +1081,9 @@ export const UI_HTML = String.raw`<!doctype html>
   }
 
   function renderCost(t) {
+    if (t.freeOnly) { renderFreeQuota(); return; }
+    $("costSummary").textContent = "Estimated cost";
+    $("costFootnote").classList.remove("hidden");
     if (!t.estimatedCost) { $("cost").innerHTML = '<p class="note">No estimate yet.</p>'; return; }
     var c = t.estimatedCost;
     var rows = [
@@ -995,6 +1112,35 @@ export const UI_HTML = String.raw`<!doctype html>
     $("cost").innerHTML = html;
   }
 
+  function renderFreeQuota() {
+    $("costSummary").textContent = "Free quota";
+    $("costFootnote").classList.add("hidden");
+    var used = Number(state.r2Bytes) || 0;
+    var budget = 9 * 1024 * 1024 * 1024;
+    var percent = Math.min(100, (used / budget) * 100);
+    var remaining = Math.max(0, budget - used);
+    var usedGb = used / 1e9;
+    var days = usedGb > 0 ? (10 / usedGb) * 30 : null;
+    var daysText = days === null ? "—" : (days > 3650 ? "> 10 years" : Math.round(days) + " days");
+
+    $("cost").innerHTML =
+      '<div class="quota">' +
+        '<div class="quota-head"><span>R2 storage: ' + bytes(used) + ' of 9 GiB safety budget</span><span>' +
+          percent.toFixed(1) + '%</span></div>' +
+        '<div class="quota-bar"><i style="width:' + percent.toFixed(1) + '%"></i></div>' +
+        '<div class="quota-grid">' +
+          '<div><span class="quota-value">' + bytes(remaining) + '</span>' +
+            '<span class="quota-label">room for another download</span></div>' +
+          '<div><span class="quota-value">' + daysText + '</span>' +
+            '<span class="quota-label">free storage at the current size</span></div>' +
+          '<div><span class="quota-value">10 GB-month</span>' +
+            '<span class="quota-label">Cloudflare R2 monthly free allowance</span></div>' +
+        '</div>' +
+        '<p class="note">Free-only caps: 2 GiB output, 4 GiB per wave, 4,096 selected pieces, 4 peers, 9 GiB bucket safety budget. ' +
+        'The days figure divides the 10 GB-month allowance by the current bucket size; it is not a bill or a reservation.</p>' +
+      '</div>';
+  }
+
   function startPolling() {
     stopPolling();
     var tick = async function () {
@@ -1019,10 +1165,8 @@ export const UI_HTML = String.raw`<!doctype html>
     if (state.timer) { clearTimeout(state.timer); state.timer = null; }
   }
 
-  function tokenQuery() { return state.token ? "?token=" + encodeURIComponent(state.token) : ""; }
   function fileUrl(key) {
-    return "/api/files/object?key=" + encodeURIComponent(key) +
-      (state.token ? "&token=" + encodeURIComponent(state.token) : "");
+    return "/api/files/object?key=" + encodeURIComponent(key);
   }
 
   async function refreshFiles() {
@@ -1030,9 +1174,12 @@ export const UI_HTML = String.raw`<!doctype html>
     var data = await api("/api/files?all=1&prefix=" + encodeURIComponent(prefix));
     var rows = (data.objects || []).map(function (o) {
       var encoded = encodeURIComponent(o.key).replace(/'/g, "%27");
+      var actions = '<a href="' + esc(fileUrl(o.key)) + '">download</a>';
+      if (canAdmin()) {
+        actions += ' <button class="button small danger" onclick="app.deleteFile(\'' + encoded + '\')">delete</button>';
+      }
       return '<tr><td class="key">' + esc(o.key) + '</td><td>' + bytes(o.size) + '</td><td>' +
-        esc(date(o.uploaded)) + '</td><td><a href="' + esc(fileUrl(o.key)) + '">download</a> ' +
-        '<button class="button small danger" onclick="app.deleteFile(\'' + encoded + '\')">delete</button></td></tr>';
+        esc(date(o.uploaded)) + '</td><td>' + actions + '</td></tr>';
     }).join("");
     $("fileRows").innerHTML = rows || '<tr><td colspan="4" class="muted">No objects.</td></tr>';
     var summary = (data.objects || []).length + " objects, " + bytes(data.totalBytes || 0);
@@ -1041,6 +1188,8 @@ export const UI_HTML = String.raw`<!doctype html>
       if (data.listingCapped) summary += " (listing capped, totals are partial)";
     }
     $("storageSummary").textContent = summary + ".";
+    state.r2Bytes = Number(data.totalBytes) || 0;
+    if (state.lastTask) renderCost(state.lastTask);
   }
 
   function resetTaskView() {
@@ -1056,6 +1205,8 @@ export const UI_HTML = String.raw`<!doctype html>
     $("files").innerHTML = "";
     $("trackersList").innerHTML = "";
     $("cost").innerHTML = "";
+    $("costSummary").textContent = "Estimated cost";
+    $("costFootnote").classList.remove("hidden");
     $("error").classList.add("hidden");
     $("mapEmpty").classList.remove("hidden");
     drawMap(0, "", false);
@@ -1065,15 +1216,18 @@ export const UI_HTML = String.raw`<!doctype html>
 
   window.app = {
     pause: async function () {
+      if (!requireAdmin()) return;
       try { await api("/api/torrents/" + state.id + "/pause", { method: "POST" }); } catch (e) { setError(e.message); }
     },
     resume: async function () {
+      if (!requireAdmin()) return;
       try { await api("/api/torrents/" + state.id + "/start", { method: "POST" }); } catch (e) { setError(e.message); }
     },
     refresh: async function () {
       try { renderTask(await api("/api/torrents/" + state.id + "?bits=1")); } catch (e) { setError(e.message); }
     },
     remove: async function () {
+      if (!requireAdmin()) return;
       if (!state.id) return;
       if (!confirm("Delete this transfer and its R2 objects?")) return;
       try {
@@ -1087,6 +1241,7 @@ export const UI_HTML = String.raw`<!doctype html>
       } catch (e) { setError(e.message); }
     },
     cleanup: async function () {
+      if (!requireAdmin()) return;
       if (!state.id) return;
       try {
         renderTask(await api("/api/torrents/" + state.id + "/cleanup", { method: "POST" }));
@@ -1095,6 +1250,7 @@ export const UI_HTML = String.raw`<!doctype html>
       } catch (e) { setError(e.message); }
     },
     deleteAll: async function () {
+      if (!requireAdmin()) return;
       var phrase = prompt("This deletes every task and every R2 object. Type DELETE to continue.");
       if (phrase !== "DELETE") return;
       try {
@@ -1109,13 +1265,14 @@ export const UI_HTML = String.raw`<!doctype html>
     },
     download: function () {
       if (!state.id) return;
-      window.location.href = "/api/torrents/" + state.id + "/download" + tokenQuery();
+      window.location.href = "/api/torrents/" + state.id + "/download";
     },
     manifest: function () {
       if (!state.id) return;
-      window.location.href = "/api/torrents/" + state.id + "/manifest" + tokenQuery();
+      window.location.href = "/api/torrents/" + state.id + "/manifest";
     },
     deleteFile: async function (encoded) {
+      if (!requireAdmin()) return;
       var key = decodeURIComponent(encoded);
       var warning = (key.indexOf("staging/") === 0 || key.indexOf("torrents/") === 0)
         ? "\n\nDeleting this object can break a running transfer."
@@ -1130,25 +1287,33 @@ export const UI_HTML = String.raw`<!doctype html>
   };
 
   function wire() {
-    var stored = localStorage.getItem("cfTorrentToken") || "";
+    var stored = localStorage.getItem("durabletorrentAdminToken") ||
+      localStorage.getItem("cfTorrentToken") || "";
     state.token = stored;
     $("token").value = stored;
+    updateAuthUi();
 
     $("saveToken").onclick = function () {
       state.token = $("token").value.trim();
-      localStorage.setItem("cfTorrentToken", state.token);
-      log("API token saved locally");
+      state.unauthorized = false;
+      localStorage.setItem("durabletorrentAdminToken", state.token);
+      updateAuthUi();
       refreshFiles().catch(function () {});
+      log("admin token saved locally");
     };
     $("browse").onclick = function () { $("file").click(); };
     $("file").onchange = function () { if ($("file").files[0]) inspectFile($("file").files[0]); };
     $("startSelected").onclick = startSelected;
     $("cancelInspect").onclick = function () {
-      state.pendingFile = null; state.pendingMeta = null;
+      state.pendingFile = null;
+      state.pendingMeta = null;
+      state.pendingMagnet = null;
+      state.pendingSource = null;
       $("inspect").classList.add("hidden");
     };
     $("addMagnet").onclick = addMagnet;
     $("addTracker").onclick = async function () {
+      if (!requireAdmin()) return;
       if (!state.id) { setError("Add a transfer first."); return; }
       var urls = parseTrackers($("newTracker").value);
       if (!urls.length) { setError("Enter an HTTP(S) tracker URL."); return; }
@@ -1195,6 +1360,14 @@ export const UI_HTML = String.raw`<!doctype html>
 
     drawMap(0, "", false);
     refreshFiles().catch(function (e) { log("initial storage read failed: " + e.message); });
+
+    api("/api")
+      .then(function (info) {
+        state.adminRequired = Boolean(info && info.auth && info.auth.mutations === "admin-token");
+        updateAuthUi();
+        refreshFiles().catch(function () {});
+      })
+      .catch(function (e) { log("could not read API mode: " + e.message); });
 
     var requested = new URLSearchParams(location.search).get("task");
     if (requested && /^[0-9a-f]{40}$/.test(requested)) {
